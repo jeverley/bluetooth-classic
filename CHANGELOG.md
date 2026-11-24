@@ -1,6 +1,59 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-11-24)
+
+### Bug Fixes
+
+- Harden RFCOMM opens and SDP reply parsing
+  ([`af3fff7`](https://github.com/jeverley/bluetooth-classic/commit/af3fff7855312231d80f5e8ec2945063af1859f4))
+
+- Close the socket when a connect is cancelled just as the open finishes. - Work out a link's
+  adapter in the worker thread, off the event loop. - Reject malformed SDP replies (attribute IDs
+  that are not numbers, deep nesting, elements running past their sequence, byte counts and
+  continuation state that do not fit, endless continuations) as ServiceLookupError. - A missing
+  adapter raises NoAdapterError. - find_rfcomm_channel only falls back to records that list the
+  service among their classes. - Reject empty rfcomm:// parameters. - Fail with TimeoutError once
+  the open's timeout has passed. - Document that blocking links are listed until closed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Features
+
+- Connect to RFCOMM services by UUID, with our own SDP client
+  ([`68e55c9`](https://github.com/jeverley/bluetooth-classic/commit/68e55c9b1b2977d3065adc875b50c97ffbce90ba))
+
+rfcomm:// URLs and open_rfcomm() take a service (a UUID or its short form), a channel, or both, plus
+  an optional adapter. With a service alone its channel is looked up in the device's SDP records;
+  with both, the channel is tried first and the service is looked up once only if the device refuses
+  it. The handler keeps no state between connections: a link reports the channel, service and
+  adapter it used through get_extra_info(), for callers to pass back next time.
+
+Open links are listed by open_rfcomm_links(), with on_rfcomm_links_changed() to follow them.
+
+Service lookups no longer run sdptool: find_rfcomm_services() and find_rfcomm_channel() (with
+  blocking forms) ask the device's SDP server directly over L2CAP, and raise ServiceLookupError when
+  it cannot be reached or answers wrongly.
+
+open_rfcomm() now takes the protocol factory second and the channel as a keyword, rfcomm_url() takes
+  keyword options, and parse_rfcomm_url() returns an RfcommTarget.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Testing
+
+- Wait for the open's thread before cancelling, on every Python
+  ([`7a46944`](https://github.com/jeverley/bluetooth-classic/commit/7a46944eb283b499e0169d27263a2f4ed040ee6b))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.4.1 (2026-11-24)
 
 ### Bug Fixes
