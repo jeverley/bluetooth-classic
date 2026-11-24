@@ -1,6 +1,26 @@
 # CHANGELOG
 
 
+## v0.4.1 (2026-11-24)
+
+### Bug Fixes
+
+- Fail early-dropped links, serialise pairing, and stop stray sdptool
+  ([`36952f2`](https://github.com/jeverley/bluetooth-classic/commit/36952f2bfdf8b1cc94614ea49f26245cd8573f32))
+
+- An RFCOMM link the device drops before the protocol is attached now fails the connect with the
+  drop's error, instead of returning a dead transport whose protocol is never told it opened or
+  closed. - pair() calls on one connection run one at a time, as the agent is exported at a single
+  path. - find_device_by_address() no longer counts a known device's class change as an answer; only
+  a new device's class, or an inquiry's signal strength, does. - Cancelling find_rfcomm_channel()
+  stops sdptool instead of leaving it running. - Entering the same BluetoothClassic twice is refused
+  rather than leaking a bus connection. - _listening() loses its unused per-path option.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.4.0 (2026-11-24)
 
 ### Features
