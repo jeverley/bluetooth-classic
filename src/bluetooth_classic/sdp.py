@@ -16,13 +16,13 @@ import asyncio
 import logging
 import socket
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from .client import normalize_address
-from .exceptions import RfcommUnsupportedError, ServiceLookupError
+from .exceptions import NoAdapterError, RfcommUnsupportedError, ServiceLookupError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +52,12 @@ _MAX_ATTRIBUTE_BYTES = 0x0400
 # Data element types.
 _UINT, _SINT, _UUID, _TEXT, _BOOL, _SEQUENCE, _ALTERNATIVE, _URL = range(1, 9)
 _FIXED_SIZES = {0: 1, 1: 2, 2: 4, 3: 8, 4: 16}
+# Service records nest a few levels; deeper replies are malformed.
+_MAX_DEPTH = 16
+# Continued replies to accept for one lookup, and the longest continuation
+# state the specification allows.
+_MAX_ROUNDS = 64
+_MAX_CONTINUATION = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +70,8 @@ class RfcommService:
     channel: int
     #: The name the device gives it, if any.
     name: str | None = None
+    #: Every class its record lists, the most specific first.
+    classes: tuple[UUID, ...] = field(default=(), compare=False)
 
 
 def service_uuid(service: UUID | str | int) -> UUID:
@@ -103,12 +111,12 @@ def adapter_address(adapter: str) -> str:
     """Return an adapter's address, such as ``hci0``'s.
 
     Raises:
-        ServiceLookupError: No such adapter.
+        NoAdapterError: No such adapter.
     """
     try:
         return (_SYSFS_BLUETOOTH / adapter / "address").read_text().strip().upper()
     except OSError as err:
-        raise ServiceLookupError(f"Bluetooth adapter {adapter} not found") from err
+        raise NoAdapterError(f"Bluetooth adapter {adapter} not found") from err
 
 
 def adapter_name(address: str) -> str | None:
@@ -164,8 +172,10 @@ def _request(transaction: int, uuid: UUID, continuation: bytes) -> bytes:
 # Replies.
 
 
-def _parse_element(data: bytes, offset: int) -> tuple[Any, int]:
+def _parse_element(data: bytes, offset: int, depth: int = 0) -> tuple[Any, int]:
     """Return a data element's value and the offset after it."""
+    if depth > _MAX_DEPTH:
+        raise ValueError("data elements nested too deeply")
     try:
         header = data[offset]
         type_, size_index = header >> 3, header & 7
@@ -200,7 +210,9 @@ def _parse_element(data: bytes, offset: int) -> tuple[Any, int]:
         items = []
         position = offset
         while position < end:
-            item, position = _parse_element(data, position)
+            item, position = _parse_element(data, position, depth + 1)
+            if position > end:
+                raise ValueError("data element runs past its sequence")
             items.append(item)
         return items, end
     raise ValueError(f"unknown data element type {type_}")
@@ -238,6 +250,8 @@ def _services(attribute_lists: bytes) -> list[RfcommService]:
     for record in records:
         if not isinstance(record, list) or len(record) % 2:
             raise ValueError("malformed service record")
+        if not all(isinstance(key, int) for key in record[::2]):
+            raise ValueError("malformed attribute ID")
         attributes = dict(zip(record[::2], record[1::2], strict=True))
         channel = _rfcomm_channel(attributes.get(_PROTOCOL_DESCRIPTOR_LIST))
         classes = attributes.get(_SERVICE_CLASS_ID_LIST)
@@ -247,7 +261,12 @@ def _services(attribute_lists: bytes) -> list[RfcommService]:
         name = attributes.get(_SERVICE_NAME)
         if isinstance(uuid, UUID):
             services.append(
-                RfcommService(uuid, channel, name if isinstance(name, str) else None)
+                RfcommService(
+                    uuid,
+                    channel,
+                    name if isinstance(name, str) else None,
+                    tuple(c for c in classes if isinstance(c, UUID)),
+                )
             )
     return services
 
@@ -282,7 +301,7 @@ def _query(
         attribute_lists = b""
         continuation = b""
         transaction = 0
-        while True:
+        for _ in range(_MAX_ROUNDS):
             transaction = (transaction + 1) & 0xFFFF
             sock.send(_request(transaction, uuid, continuation))
             reply = sock.recv(0x10000)
@@ -298,13 +317,19 @@ def _query(
             if pdu != _SERVICE_SEARCH_ATTRIBUTE_RESPONSE or length < 3:
                 raise ValueError(f"unexpected reply {pdu:#x}")
             count = struct.unpack(">H", parameters[:2])[0]
+            if 2 + count + 1 > length:
+                raise ValueError("attribute byte count runs past the reply")
             attribute_lists += parameters[2 : 2 + count]
             state = parameters[2 + count :]
-            if not state or state[0] == 0:
+            if state[0] > _MAX_CONTINUATION or len(state) != 1 + state[0]:
+                raise ValueError("malformed continuation state")
+            if state[0] == 0:
                 break
-            continuation = state[1 : 1 + state[0]]
+            continuation = state[1:]
+        else:
+            raise ValueError("reply continued too many times")
         return _services(attribute_lists) if attribute_lists else []
-    except ServiceLookupError:
+    except (ServiceLookupError, NoAdapterError):
         raise
     except (OSError, ValueError) as err:
         raise ServiceLookupError(
@@ -358,11 +383,15 @@ def find_rfcomm_channel_blocking(
         address, uuid, adapter=adapter, timeout=timeout
     )
     # Prefer a record whose own class is the service; a record may also list
-    # it as one of several classes.
+    # it as one of several classes. The search also matches records that only
+    # mention the UUID elsewhere (a profile list): those are other services.
     for record in found:
         if record.uuid == uuid:
             return record.channel
-    return found[0].channel if found else None
+    for record in found:
+        if uuid in record.classes:
+            return record.channel
+    return None
 
 
 async def find_rfcomm_services(

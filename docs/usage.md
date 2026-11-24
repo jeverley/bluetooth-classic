@@ -97,7 +97,8 @@ a channel, or both:
   channel is tried first; if the device refuses it, the service is looked
   up once and the channel found is used.
 - `adapter` (optional): the local adapter, such as `hci0`. Without it,
-  Linux chooses.
+  Linux chooses. One that does not exist raises
+  {class}`~bluetooth_classic.NoAdapterError`.
 - `security` (optional): `low`, `medium` (an authenticated, encrypted link,
   so the device must be paired) or `high`. Without it, Linux's default is
   left alone. A level that cannot be set fails the connection.
@@ -112,7 +113,8 @@ An open connection also reports `rfcomm_service` and `rfcomm_adapter`
 through `get_extra_info()`. {func}`~bluetooth_classic.open_rfcomm_links`
 lists the links open through the handler, and
 {func}`~bluetooth_classic.on_rfcomm_links_changed` calls back whenever one
-opens or closes.
+opens or closes. A blocking `serial_for_url()` port is listed until it is
+closed, even if the device has dropped the link.
 
 Two connection options are also accepted: `connect_timeout`, which covers a
 lookup too, and `write_on_connect`, bytes written by the thread that opens

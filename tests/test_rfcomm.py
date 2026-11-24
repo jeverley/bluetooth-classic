@@ -7,6 +7,7 @@ import contextlib
 import socket
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
@@ -143,6 +144,8 @@ def test_service_urls() -> None:
         "rfcomm://00:11:22:33:44:55?service=serial",
         "rfcomm://00:11:22:33:44:55?channel=1&adapter=eth0",
         "rfcomm://00:11:22:33:44:55?channel=1&colour=blue",
+        "rfcomm://00:11:22:33:44:55?service=1101&channel=",
+        "rfcomm://00:11:22:33:44:55?channel=1&security=",
         "rfcomm://not-an-address?channel=1",
     ],
 )
@@ -310,9 +313,9 @@ async def test_cancelling_a_connect_closes_the_socket_after_the_thread() -> None
         def close(self) -> None:
             closed.set()
 
-    def blocking_open(*args: object) -> tuple[_Socket, int]:
+    def blocking_open(*args: object) -> tuple[_Socket, RfcommLink]:
         release.wait(5)
-        return _Socket(), 1
+        return _Socket(), RfcommLink(ADDRESS, 1, None, None)
 
     loop = asyncio.get_running_loop()
     with (
@@ -334,6 +337,55 @@ async def test_cancelling_a_connect_closes_the_socket_after_the_thread() -> None
                 break
             await asyncio.sleep(0.01)
         assert closed.is_set()
+
+
+async def test_cancelling_as_the_open_finishes_closes_the_socket() -> None:
+    returned = threading.Event()
+    closed = threading.Event()
+
+    class _Socket:
+        def close(self) -> None:
+            closed.set()
+
+    def quick_open(*args: object) -> tuple[_Socket, RfcommLink]:
+        returned.set()
+        return _Socket(), RfcommLink(ADDRESS, 1, None, None)
+
+    loop = asyncio.get_running_loop()
+    with (
+        patch.object(rfcomm, "rfcomm_supported", return_value=True),
+        patch.object(rfcomm, "_open_link", quick_open),
+    ):
+        task = asyncio.ensure_future(
+            serialx.create_serial_connection(loop, _Recorder, URL, baudrate=9600)
+        )
+        await asyncio.sleep(0)
+        # The thread has finished and posted its result, but the loop has not
+        # run since: the cancel lands before the task sees the socket.
+        assert returned.wait(5)
+        time.sleep(0.1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        for _ in range(100):
+            if closed.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert closed.is_set()
+
+
+def test_the_whole_open_is_bounded_by_the_timeout(link: _Link) -> None:
+    def slow_look_up(*args: Any, **kwargs: Any) -> int:
+        time.sleep(0.1)
+        return 3
+
+    link.refused = {1}
+    target = parse_rfcomm_url(f"{SERVICE_URL}&channel=1")
+    with (
+        patch.object(rfcomm, "find_rfcomm_channel_blocking", slow_look_up),
+        pytest.raises(TimeoutError),
+    ):
+        rfcomm._open_link(target, 0.05, b"")
 
 
 async def _open(link: _Link, url: str) -> tuple[asyncio.Transport, _Recorder]:

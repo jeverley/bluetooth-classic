@@ -11,6 +11,7 @@ import pytest
 
 from bluetooth_classic import (
     SERIAL_PORT,
+    NoAdapterError,
     RfcommService,
     ServiceLookupError,
     find_rfcomm_channel,
@@ -50,6 +51,11 @@ def _uuid128(value: UUID) -> bytes:
 def _text(value: str) -> bytes:
     data = value.encode()
     return bytes([0x25, len(data)]) + data
+
+
+def _alt(*items: bytes) -> bytes:
+    body = b"".join(items)
+    return bytes([0x3D, len(body)]) + body
 
 
 def _record(classes: bytes, channel: int | None, name: str | None = None) -> bytes:
@@ -176,6 +182,36 @@ async def test_vendor_services_use_long_uuids() -> None:
     assert _uuid128(VENDOR) in sock.sent[0]
 
 
+async def test_ignores_records_that_only_mention_the_service() -> None:
+    # A vendor service that lists the Serial Port only in its profile list.
+    records = _seq(
+        _seq(
+            _u16(0x0001),
+            _seq(_uuid128(VENDOR)),
+            _u16(0x0004),
+            _seq(_seq(_uuid16(0x0100)), _seq(_uuid16(0x0003), _u8(4))),
+            _u16(0x0009),
+            _seq(_seq(_uuid16(0x1101), _u16(0x0102))),
+        )
+    )
+    with _patched(_Socket([_reply(1, records)])):
+        assert await find_rfcomm_channel(ADDRESS) is None
+
+
+async def test_reads_alternative_protocol_lists() -> None:
+    record = _seq(
+        _u16(0x0001),
+        _seq(_uuid16(0x1101)),
+        _u16(0x0004),
+        _alt(
+            _seq(_seq(_uuid16(0x0100), _u16(0x1001))),
+            _seq(_seq(_uuid16(0x0100)), _seq(_uuid16(0x0003), _u8(5))),
+        ),
+    )
+    with _patched(_Socket([_reply(1, _seq(record))])):
+        assert await find_rfcomm_channel(ADDRESS) == 5
+
+
 async def test_follows_continuations() -> None:
     sock = _Socket([_reply(1, RECORDS[:20], b"\x01\x02"), _reply(2, RECORDS[20:])])
     with _patched(sock):
@@ -200,8 +236,29 @@ async def test_no_such_service() -> None:
         [_reply(2, RECORDS)],
         [struct.pack(">BHHH", 0x01, 1, 2, 0x0002)],
         [_reply(1, b"\x35\x10\x09")],
+        # The byte count runs past the reply.
+        [struct.pack(">BHHH", 0x07, 1, 3, 0x0400) + b"\x00"],
+        # The continuation length does not match.
+        [_reply(1, RECORDS)[:-1] + b"\x05"],
+        # An attribute ID that is a sequence.
+        [_reply(1, _seq(_seq(_seq(_u16(1)), _seq())))],
+        # Sequences nested far too deeply.
+        [_reply(1, b"\x35\x02" * 40 + b"\x35\x00")],
+        # A server that never stops continuing.
+        [_reply(n, b"", b"\x01\x02") for n in range(1, 70)],
     ],
-    ids=["timeout", "short", "wrong-transaction", "error", "malformed"],
+    ids=[
+        "timeout",
+        "short",
+        "wrong-transaction",
+        "error",
+        "malformed",
+        "byte-count",
+        "continuation",
+        "attribute-id",
+        "nesting",
+        "endless",
+    ],
 )
 async def test_bad_answers_fail_the_lookup(replies: list[bytes]) -> None:
     sock = _Socket(replies)
@@ -243,5 +300,5 @@ def test_adapter_names(tmp_path: Any) -> None:
         assert sdp.adapter_address("hci0") == "AA:BB:CC:DD:EE:FF"
         assert sdp.adapter_name("AA:BB:CC:DD:EE:FF") == "hci0"
         assert sdp.adapter_name("00:11:22:33:44:55") is None
-        with pytest.raises(ServiceLookupError):
+        with pytest.raises(NoAdapterError):
             sdp.adapter_address("hci9")

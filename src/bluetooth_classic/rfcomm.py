@@ -173,12 +173,14 @@ def parse_rfcomm_url(url: str) -> RfcommTarget:
     if not url.startswith(SCHEME):
         raise ValueError(f"Not an rfcomm:// URL: {url}")
     address, _, query = url.removeprefix(SCHEME).partition("?")
-    params = urllib.parse.parse_qs(query)
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
     for name, values in params.items():
         if name not in ("service", "channel", "security", "adapter"):
             raise ValueError(f"Unknown rfcomm:// parameter {name}: {url}")
         if len(values) != 1:
             raise ValueError(f"rfcomm:// {name} given more than once: {url}")
+        if not values[0]:
+            raise ValueError(f"rfcomm:// {name} is empty: {url}")
     value = {name: values[0] for name, values in params.items()}
     try:
         service = service_uuid(value["service"]) if "service" in value else None
@@ -218,7 +220,12 @@ _listeners: list[Callable[[], None]] = []
 
 
 def open_rfcomm_links() -> list[RfcommLink]:
-    """Return the RFCOMM links this process has open through the handler."""
+    """Return the RFCOMM links this process has open through the handler.
+
+    An async link is removed when it drops or is closed. A blocking
+    ``RfcommSerial`` link is listed until the port is closed, even if the
+    device has dropped it.
+    """
     with _links_lock:
         return list(_links.values())
 
@@ -324,16 +331,21 @@ def _look_up(target: RfcommTarget, timeout: float | None) -> int:
 
 def _open_link(
     target: RfcommTarget, timeout: float | None, write_on_connect: bytes
-) -> tuple[socket.socket, int]:
+) -> tuple[socket.socket, RfcommLink]:
     """Open the link and write write_on_connect at once; runs in a worker thread.
 
-    Returns the connected socket and the channel it is on. ``timeout``
-    bounds the whole open, a lookup included.
+    Returns the connected socket and the link it is. ``timeout`` bounds the
+    whole open, a lookup included. Describing the link reads sysfs, so it is
+    done here, off the event loop.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
 
     def remaining() -> float | None:
-        return None if deadline is None else max(deadline - time.monotonic(), 0.1)
+        if deadline is None:
+            return None
+        if (left := deadline - time.monotonic()) <= 0:
+            raise TimeoutError(f"Timed out opening a link to {target.address}")
+        return left
 
     looked_up = target.channel is None
     channel = _look_up(target, remaining()) if looked_up else target.channel
@@ -359,10 +371,11 @@ def _open_link(
     try:
         if write_on_connect:
             sock.sendall(write_on_connect)
+        link = _link(target, sock, channel)
     except BaseException:
         sock.close()
         raise
-    return sock, channel
+    return sock, link
 
 
 def _link(target: RfcommTarget, sock: socket.socket, channel: int) -> RfcommLink:
@@ -375,7 +388,7 @@ def _link(target: RfcommTarget, sock: socket.socket, channel: int) -> RfcommLink
     return RfcommLink(target.address, channel, adapter, target.service)
 
 
-def _close_after(job: asyncio.Future[tuple[socket.socket, int]]) -> None:
+def _close_after(job: asyncio.Future[tuple[socket.socket, RfcommLink]]) -> None:
     """Close the socket of an abandoned open once its thread is done."""
     if job.cancelled():
         return
@@ -407,12 +420,12 @@ class RfcommSerial(SocketSerial):
 
     def _open(self) -> None:
         """Open the link and write write_on_connect."""
-        sock, channel = _open_link(
+        sock, link = _open_link(
             self._target, self._connect_timeout, self._write_on_connect
         )
         self._socket = sock
-        self.link = _link(self._target, sock, channel)
-        _add_link(id(self), self.link)
+        self.link = link
+        _add_link(id(self), link)
 
     def _close(self) -> None:
         """Close the link."""
@@ -496,13 +509,13 @@ class RfcommSerialTransport(SocketSerialTransport):
         )
         try:
             # Shielded: a cancelled open is left to finish, then closed.
-            sock, channel = await asyncio.shield(job)
+            sock, link = await asyncio.shield(job)
         except BaseException:
-            if not job.done():
-                job.add_done_callback(_close_after)
+            # Also when the open finished just as this was cancelled: the
+            # callback then runs at once and closes the socket.
+            job.add_done_callback(_close_after)
             raise
         try:
-            link = _link(target, sock, channel)
             sock.setblocking(False)
             transport, _ = await self._loop.create_connection(
                 lambda: _RfcommProxyProtocol(self), sock=sock
@@ -512,7 +525,7 @@ class RfcommSerialTransport(SocketSerialTransport):
             raise
         self._tcp_transport = transport
         self._extra.update(
-            rfcomm_channel=channel,
+            rfcomm_channel=link.channel,
             rfcomm_service=target.service,
             rfcomm_adapter=link.adapter,
         )
@@ -605,6 +618,7 @@ async def open_rfcomm(
 
     Raises:
         ValueError: Neither a service nor a channel, or one not valid.
+        NoAdapterError: The adapter asked for does not exist.
         RfcommUnsupportedError: This Python cannot open RFCOMM sockets.
         ServiceLookupError: The service's channel could not be looked up, or
             the device does not offer it.
