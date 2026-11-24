@@ -1,6 +1,35 @@
 # CHANGELOG
 
 
+## v0.1.1 (2026-11-24)
+
+### Bug Fixes
+
+- Make scans and BlueZ calls more robust
+  ([`a4512c2`](https://github.com/jeverley/bluetooth-classic/commit/a4512c28751a2dbac24426fb29fc92b4d8dc45ce))
+
+- discover() returns only devices with a Classic device class, so a Low Energy device whose only
+  change is a signal strength is left out. - The discovery filter is cleared when a scan ends, so it
+  does not shape later scans. - Calls to BlueZ wait at most 10 seconds for an answer; pairing keeps
+  its own timeout. - A scan or pairing on a powered-off adapter raises NoAdapterError.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Continuous Integration
+
+- Publish an already tagged release to PyPI on request
+  ([`017b741`](https://github.com/jeverley/bluetooth-classic/commit/017b74103296b93499c2b1a1442fe0cd9bf1c22d))
+
+If publishing fails after the release is tagged, running the workflow again makes no new release, so
+  nothing is published. A manual run with the tag now builds that release and publishes it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.1.0 (2026-11-23)
 
 ### Continuous Integration

@@ -1,6 +1,6 @@
 """Bluetooth Classic discovery, pairing and presence on Linux, through BlueZ."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .client import BluetoothClassic, normalize_address
 from .const import DEFAULT_PIN, DISCOVERY_SECONDS, PAIR_TIMEOUT, PRESENCE_SECONDS
