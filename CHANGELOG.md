@@ -1,6 +1,27 @@
 # CHANGELOG
 
 
+## v0.6.1 (2026-11-24)
+
+### Bug Fixes
+
+- Handle BlueZ's handover on a D-Bus thread of its own
+  ([`db3e18f`](https://github.com/jeverley/bluetooth-classic/commit/db3e18fef21b10409b91c9387eb50eee717c15ae))
+
+The profile API's D-Bus work (registering, connecting, disconnecting and BlueZ's
+  Profile1.NewConnection call) now runs on an event loop of its own, in a background thread.
+  write_on_connect is written the moment BlueZ hands the connection over, however busy the caller's
+  event loop is: a device that changes state soon after a connection opens (an LG soundbar moving to
+  Bluetooth within 0.2 s) was answered too late while Home Assistant was starting up. The socket is
+  then handed to the caller's loop. A connect the caller stops waiting for finishes on the D-Bus
+  loop (within its timeout), and a link it opens is closed and released. The timeout is one deadline
+  for the whole open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.6.0 (2026-11-24)
 
 ### Bug Fixes
