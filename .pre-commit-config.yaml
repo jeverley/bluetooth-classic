@@ -40,4 +40,4 @@ repos:
     rev: v1.15.0
     hooks:
       - id: mypy
-        additional_dependencies: [dbus-fast, pytest]
+        additional_dependencies: [dbus-fast, pytest, serialx]

@@ -112,10 +112,12 @@ def _rfcomm_socket(security: Security | None) -> socket.socket:
         raise RfcommUnsupportedError(
             "This Python was built without Bluetooth socket support"
         )
+    # Only defined where Python was built with Bluetooth support, so not in
+    # every platform's type stubs.
     sock = socket.socket(
-        socket.AF_BLUETOOTH,
+        socket.AF_BLUETOOTH,  # type: ignore[attr-defined, unused-ignore]
         socket.SOCK_STREAM,
-        socket.BTPROTO_RFCOMM,
+        socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined, unused-ignore]
     )
     if security is not None:
         try:
