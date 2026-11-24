@@ -17,3 +17,7 @@ class DeviceNotFoundError(BluetoothClassicError):
 
 class PairingError(BluetoothClassicError):
     """The device could not be paired."""
+
+
+class RfcommUnsupportedError(BluetoothClassicError):
+    """This Python cannot open RFCOMM sockets (built without Bluetooth)."""

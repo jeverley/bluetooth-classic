@@ -54,3 +54,41 @@ Energy scanning, but it does pause it. The filter is cleared when the scan
 ends. Keep scans short, and in an
 application that also scans for Low Energy devices, let one part of it
 decide when they run.
+
+## Serial connections (RFCOMM)
+
+Importing `bluetooth_classic` registers an `rfcomm://` handler with
+[serialx](https://github.com/puddly/serialx), so its functions open a
+device's RFCOMM channel like any serial port:
+
+```python
+transport, protocol = await serialx.create_serial_connection(
+    loop, MyProtocol, "rfcomm://00:11:22:33:44:55?channel=1", baudrate=9600
+)
+```
+
+The baud rate is required by serialx and ignored. The URL takes:
+
+- `channel`: the RFCOMM channel, 1 to 30.
+- `security` (optional): `low`, `medium` (an authenticated, encrypted link,
+  so the device must be paired) or `high`. Without it, Linux's default is
+  left alone. A level that cannot be set fails the connection.
+
+Two connection options are also accepted: `connect_timeout`, and
+`write_on_connect`, bytes written by the thread that opens the link the
+moment it opens, before the event loop gets to it. Use it for a device that
+changes state soon after a connection opens and only answers a request sent
+before then.
+
+{func}`~bluetooth_classic.open_rfcomm` is a shortcut that builds the URL.
+{func}`~bluetooth_classic.rfcomm_supported` says whether this Python can
+open RFCOMM sockets at all; it needs Linux and a Python built with
+Bluetooth support.
+
+## Finding a channel
+
+{func}`~bluetooth_classic.find_rfcomm_channel` asks a device which channel it
+offers a service on, by default the serial port. It uses `sdptool`, from
+BlueZ's deprecated tools, as BlueZ's D-Bus interface does not give a
+service's channel. It returns `None` if `sdptool` is missing or the device
+does not answer; callers can then try likely channels in turn.

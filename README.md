@@ -32,16 +32,15 @@
 
 <!-- docs-start -->
 
-Bluetooth Classic (BR/EDR) discovery, pairing and presence on Linux, through
-BlueZ.
+Bluetooth Classic (BR/EDR) discovery, pairing, presence and RFCOMM serial
+connections on Linux.
 
 Python has good libraries for Bluetooth Low Energy, such as
 [Bleak](https://github.com/hbldh/bleak), but none of them handle Bluetooth
 Classic devices: speakers, headphones, printers and serial adapters. This
-library fills that gap for the housekeeping around such a device. It talks to
-BlueZ over D-Bus with [dbus-fast](https://github.com/Bluetooth-Devices/dbus-fast),
-in your own asyncio event loop, without compiled extensions or command-line
-tools.
+library fills that gap. It talks to BlueZ over D-Bus with
+[dbus-fast](https://github.com/Bluetooth-Devices/dbus-fast), in your own
+asyncio event loop, without compiled extensions.
 
 - **Discover** nearby Classic devices, with their names, services and signal
   strength.
@@ -50,9 +49,12 @@ tools.
 - **Check presence**: whether a known device is on, with a short Classic scan
   that never connects to it, so it does not wake a device that wakes when
   connected to.
+- **Connect** to a device's serial port (RFCOMM) through
+  [serialx](https://github.com/puddly/serialx), with `rfcomm://` URLs, and
+  find its channel.
 
-Connections to a device's services are out of scope: use RFCOMM sockets, or a
-library such as [aio-rfcomm](https://github.com/dlech/aio-rfcomm).
+It covers what a Classic device needs that the usual Python Bluetooth
+libraries do not, and nothing about any one kind of device.
 
 ## Installation
 
@@ -67,6 +69,8 @@ It needs Linux with BlueZ 5, and Python 3.11 or newer.
 ```python
 import asyncio
 
+import serialx
+
 from bluetooth_classic import BluetoothClassic
 
 
@@ -80,6 +84,11 @@ async def main() -> None:
 
         result = await bluetooth.check_presence(device.address)
         print("on" if result.present else "off")
+
+    # The device's serial port, as a serialx connection.
+    reader, writer = await serialx.open_serial_connection(
+        "rfcomm://00:11:22:33:44:55?channel=1", baudrate=9600
+    )
 
 
 asyncio.run(main())
