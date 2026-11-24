@@ -1,6 +1,23 @@
 # CHANGELOG
 
 
+## v0.6.2 (2026-11-24)
+
+### Bug Fixes
+
+- Log when BlueZ hands a connection over, and when the bytes go out
+  ([`f4a153e`](https://github.com/jeverley/bluetooth-classic/commit/f4a153e240f5abefbc97f684e7e6982076038487))
+
+The D-Bus thread logs when it asks BlueZ to connect a service, and when BlueZ's NewConnection
+  arrives: how long after asking, and how soon after that the bytes to send were written. A device
+  that changes state soon after a connection opens can then be checked against where the time went:
+  BlueZ connecting, or this process.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.6.1 (2026-11-24)
 
 ### Bug Fixes
