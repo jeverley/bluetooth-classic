@@ -1,6 +1,23 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-11-24)
+
+### Features
+
+- Rename check_presence() to scan_for()
+  ([`4d73f62`](https://github.com/jeverley/bluetooth-classic/commit/4d73f62bb1c1fac3a62681fb6d4ffd5915c27e7d))
+
+"Presence" reads as people being home, which this cannot tell: it finds only discoverable devices,
+  and phones usually are not. scan_for() says what it does. PresenceResult becomes ScanResult, with
+  found in place of present, and PRESENCE_SECONDS becomes SCAN_FOR_SECONDS. The old names are
+  removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.2.0 (2026-11-24)
 
 ### Bug Fixes
