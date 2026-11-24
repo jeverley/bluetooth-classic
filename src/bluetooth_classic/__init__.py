@@ -1,6 +1,6 @@
 """Bluetooth Classic discovery, pairing, presence and RFCOMM serial on Linux."""
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 from .client import BluetoothClassic, normalize_address
 from .const import DEFAULT_PIN, DISCOVERY_SECONDS, PAIR_TIMEOUT, PRESENCE_SECONDS

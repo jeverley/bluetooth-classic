@@ -1,6 +1,42 @@
 # CHANGELOG
 
 
+## v0.2.0 (2026-11-24)
+
+### Bug Fixes
+
+- Pass the pre-commit type check for the RFCOMM handler
+  ([`547fe07`](https://github.com/jeverley/bluetooth-classic/commit/547fe07d99e6974b2580d679dc67488ca055f5fa))
+
+Pre-commit's mypy now has serialx installed, and the Bluetooth socket names, which not every
+  platform's type stubs define, are allowed to be missing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Features
+
+- Open RFCOMM serial connections with rfcomm:// URLs
+  ([`2d42e5f`](https://github.com/jeverley/bluetooth-classic/commit/2d42e5f0c9c167f8ea98d5706e1c0b45ed47e45f))
+
+Importing bluetooth_classic registers an rfcomm:// handler with serialx:
+  rfcomm://<address>?channel=<n>&security=low|medium|high. A worker thread opens the link and writes
+  the write_on_connect bytes the moment it opens, before the event loop gets to it; a cancelled
+  connect closes the socket once the thread is done. Reading, writing and closing reuse serialx's
+  socket handling. open_rfcomm() builds the URL and connects.
+
+find_rfcomm_channel() looks up the channel a device offers a service on, with sdptool, returning
+  None when it cannot.
+
+The library's scope grows from discovery, pairing and presence to what Classic devices need that
+  Home Assistant's Bluetooth libraries lack.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.1.1 (2026-11-24)
 
 ### Bug Fixes
