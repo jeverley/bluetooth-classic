@@ -92,15 +92,20 @@ class _Profile(ServiceInterface):
 
     def __init__(self, on_stray: Callable[[str], None]) -> None:
         super().__init__("org.bluez.Profile1")
-        # Per device path, in order: bytes to write at once, and the waiter.
-        self._waiting: dict[str, list[tuple[bytes, asyncio.Future[Handover]]]] = {}
+        # Per device path, in order: bytes to write at once, the waiter, and
+        # when BlueZ was asked to connect (time.monotonic()).
+        self._waiting: dict[
+            str, list[tuple[bytes, asyncio.Future[Handover], float]]
+        ] = {}
         # Called with the device path of a connection nobody waits for.
         self._on_stray = on_stray
 
     def expect(self, device_path: str, write: bytes) -> asyncio.Future[Handover]:
         """Wait for the next connection to a device."""
         future: asyncio.Future[Handover] = asyncio.get_running_loop().create_future()
-        self._waiting.setdefault(device_path, []).append((write, future))
+        self._waiting.setdefault(device_path, []).append(
+            (write, future, time.monotonic())
+        )
         return future
 
     def forget(self, device_path: str, future: asyncio.Future[Handover]) -> None:
@@ -127,11 +132,12 @@ class _Profile(ServiceInterface):
     def NewConnection(
         self, device: DBusObjectPath, fd: DBusUnixFd, properties: DBusDict
     ) -> None:
+        arrived = time.monotonic()
         waiting = self._waiting.get(device)
         if not waiting:
             self._stray(device, fd)
             return
-        write, future = waiting.pop(0)
+        write, future, asked = waiting.pop(0)
         if not waiting:
             del self._waiting[device]
         if future.done():
@@ -148,7 +154,17 @@ class _Profile(ServiceInterface):
             self._on_stray(device)
             future.set_exception(err)
             return
-        future.set_result(Handover(fd, device, time.monotonic()))
+        written = time.monotonic()
+        # Logged after writing, so the write is not held up.
+        _LOGGER.debug(
+            "BlueZ handed over %s %.3f s after it was asked; %d bytes written"
+            " %.1f ms later",
+            device,
+            arrived - asked,
+            len(write),
+            (written - arrived) * 1000,
+        )
+        future.set_result(Handover(fd, device, written))
 
     @method()
     def RequestDisconnection(self, device: DBusObjectPath) -> None:
@@ -475,6 +491,7 @@ async def _connect(
 ) -> Handover:
     """Ask BlueZ to connect, and wait for the socket it hands over."""
     bus, profile = registration.bus, registration.profile
+    _LOGGER.debug("Asking BlueZ to connect %s on %s", service, device_path)
     future = profile.expect(device_path, write_on_connect)
     reply = asyncio.ensure_future(
         _call(
