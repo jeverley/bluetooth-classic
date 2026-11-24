@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v0.4.0 (2026-11-24)
+
+### Features
+
+- Follow bleak's names: async with, find_device_by_address(), unpair()
+  ([`3317db0`](https://github.com/jeverley/bluetooth-classic/commit/3317db0cd6c447cc8369077e800c1be338e5ad90))
+
+BluetoothClassic is constructed directly and opened with async with, as bleak's scanner and client
+  are, instead of with connect(). discover() takes timeout. scan_for() becomes
+  find_device_by_address(), which returns the device or None, stops as soon as it answers, and also
+  finds devices BlueZ did not know; ScanResult is removed. unpair() removes a device from BlueZ, as
+  bleak's does on Linux. DISCOVERY_SECONDS and SCAN_FOR_SECONDS become DISCOVERY_TIMEOUT and
+  FIND_TIMEOUT. The old names are removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.3.0 (2026-11-24)
 
 ### Features
