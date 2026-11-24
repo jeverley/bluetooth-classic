@@ -31,7 +31,9 @@ from .conftest import (
 
 
 async def connect(bus: FakeBus, adapter: str | None = None) -> BluetoothClassic:
-    return await BluetoothClassic.connect(adapter, bus=bus)  # type: ignore[arg-type]
+    """Return a connection opened on the fake bus, as async with would."""
+    bluetooth = BluetoothClassic(adapter, bus=bus)  # type: ignore[arg-type]
+    return await bluetooth.__aenter__()
 
 
 def test_normalize_address() -> None:
@@ -64,13 +66,13 @@ async def test_connect_opens_and_closes_its_own_bus(bus: FakeBus) -> None:
     opened = AsyncMock(return_value=bus)
     with patch("bluetooth_classic.client.MessageBus") as message_bus:
         message_bus.return_value.connect = opened
-        async with await BluetoothClassic.connect() as bluetooth:
+        async with BluetoothClassic() as bluetooth:
             assert bluetooth.adapter == "hci0"
     assert bus.disconnected
 
 
 async def test_a_given_bus_is_left_open(bus: FakeBus) -> None:
-    async with await connect(bus):
+    async with BluetoothClassic(bus=bus):  # type: ignore[arg-type]
         pass
     assert not bus.disconnected
 
@@ -79,7 +81,8 @@ async def test_connect_reports_an_unreachable_bus() -> None:
     with patch("bluetooth_classic.client.MessageBus") as message_bus:
         message_bus.return_value.connect = AsyncMock(side_effect=OSError("no bus"))
         with pytest.raises(BluetoothClassicError):
-            await BluetoothClassic.connect()
+            async with BluetoothClassic():
+                pass
 
 
 async def test_devices_and_device(bus: FakeBus) -> None:
@@ -114,7 +117,7 @@ async def test_discover_returns_classic_devices_that_answered(bus: FakeBus) -> N
         },
     }
     bluetooth = await connect(bus)
-    found = await bluetooth.discover(seconds=0.05)
+    found = await bluetooth.discover(timeout=0.05)
     assert {(d.address, d.rssi) for d in found} == {
         (SPEAKER_ADDRESS, -60),
         ("AA:BB:CC:DD:EE:FF", -70),
@@ -130,7 +133,7 @@ async def test_discover_returns_classic_devices_that_answered(bus: FakeBus) -> N
     assert bus.handlers == []
 
 
-async def test_scan_for_when_the_device_answers(bus: FakeBus) -> None:
+async def test_find_device_by_address_when_it_answers(bus: FakeBus) -> None:
     bus.on_discovery = [
         # Low Energy advertising also brings a signal strength: not an answer.
         (
@@ -140,29 +143,46 @@ async def test_scan_for_when_the_device_answers(bus: FakeBus) -> None:
         (SPEAKER, {"RSSI": Variant("n", -60), "TxPower": Variant("n", 4)}),
     ]
     bluetooth = await connect(bus)
-    result = await bluetooth.scan_for(SPEAKER_ADDRESS, seconds=1)
-    assert result.found
-    assert result.after is not None
-    assert result.changed["RSSI"] == -60
-    assert result.changed["TxPower"] == 4
-    assert result.changed["ManufacturerData"] == "{}"
+    device = await bluetooth.find_device_by_address("00-11-22-33-44-55", timeout=1)
+    assert device is not None
+    assert device.address == SPEAKER_ADDRESS
+    assert device.rssi == -60
     assert bus.members().count("StopDiscovery") == 1
     assert bus.matches == []
 
 
-async def test_scan_for_when_the_device_is_off(bus: FakeBus) -> None:
-    bus.objects[SPEAKER][DEVICE]["Connected"] = Variant("b", True)
+async def test_find_device_by_address_when_it_does_not_answer(bus: FakeBus) -> None:
     bluetooth = await connect(bus)
-    result = await bluetooth.scan_for(SPEAKER_ADDRESS, seconds=0.05)
-    assert not result.found
-    assert result.linked
+    assert await bluetooth.find_device_by_address(SPEAKER_ADDRESS, timeout=0.05) is None
     assert bus.members().count("StopDiscovery") == 1
 
 
-async def test_scan_for_of_an_unknown_device(bus: FakeBus) -> None:
+async def test_find_device_by_address_finds_an_unknown_device(bus: FakeBus) -> None:
+    phone = f"{HCI0}/dev_AA_BB_CC_DD_EE_FF"
+    bus.added_on_discovery = {
+        phone: device_properties("AA:BB:CC:DD:EE:FF", "Phone", RSSI=Variant("n", -70))
+    }
     bluetooth = await connect(bus)
-    with pytest.raises(DeviceNotFoundError):
-        await bluetooth.scan_for("AA:BB:CC:DD:EE:FF")
+    device = await bluetooth.find_device_by_address("AA:BB:CC:DD:EE:FF", timeout=1)
+    assert device is not None
+    assert device.name == "Phone"
+    assert device.rssi == -70
+
+
+async def test_unpair_removes_the_device(bus: FakeBus) -> None:
+    bluetooth = await connect(bus)
+    await bluetooth.unpair(SPEAKER_ADDRESS)
+    assert ("RemoveDevice", HCI0, [SPEAKER]) in bus.calls
+    assert await bluetooth.device(SPEAKER_ADDRESS) is None
+    # Unknown devices are left alone.
+    await bluetooth.unpair(SPEAKER_ADDRESS)
+    assert bus.members().count("RemoveDevice") == 1
+
+
+async def test_using_it_outside_async_with_is_refused(bus: FakeBus) -> None:
+    bluetooth = BluetoothClassic(bus=bus)  # type: ignore[arg-type]
+    with pytest.raises(BluetoothClassicError):
+        await bluetooth.devices()
 
 
 async def test_pair_registers_an_agent_for_the_pairing_only(bus: FakeBus) -> None:
@@ -236,7 +256,7 @@ async def test_discover_leaves_out_devices_without_a_device_class(
         (beacon, {"RSSI": Variant("n", -50)}),
     ]
     bluetooth = await connect(bus)
-    found = await bluetooth.discover(seconds=0.05)
+    found = await bluetooth.discover(timeout=0.05)
     assert [d.address for d in found] == [SPEAKER_ADDRESS]
 
 
@@ -244,9 +264,9 @@ async def test_scans_report_a_powered_off_adapter(bus: FakeBus) -> None:
     bus.errors["StartDiscovery"] = "org.bluez.Error.NotReady"
     bluetooth = await connect(bus)
     with pytest.raises(NoAdapterError):
-        await bluetooth.discover(seconds=0.05)
+        await bluetooth.discover(timeout=0.05)
     with pytest.raises(NoAdapterError):
-        await bluetooth.scan_for(SPEAKER_ADDRESS, seconds=0.05)
+        await bluetooth.find_device_by_address(SPEAKER_ADDRESS, timeout=0.05)
     # Nothing left behind: the filter is cleared and nothing listens.
     filters = [c[2][0] for c in bus.calls if c[0] == "SetDiscoveryFilter"]
     assert filters[-1] == {}

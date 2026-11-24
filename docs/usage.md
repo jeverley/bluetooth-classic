@@ -2,11 +2,19 @@
 
 ## Connecting
 
-{meth}`~bluetooth_classic.BluetoothClassic.connect` opens a connection to
-BlueZ on the system bus and chooses an adapter: the one you name, such as
-`"hci0"`, or else the first powered one. Use it as an async context manager
-so the connection is closed afterwards. An application that already has a
-system bus connection can pass it as `bus`; it is then left open.
+{class}`~bluetooth_classic.BluetoothClassic` is used as an async context
+manager, like bleak's `BleakScanner` and `BleakClient`:
+
+```python
+async with BluetoothClassic(adapter="hci0") as bluetooth:
+    ...
+```
+
+Entering the block connects to BlueZ on the system bus and chooses the
+adapter: the one you name, or else the first powered one. Leaving it closes
+the connection. An application that already has a system bus connection can
+pass it as `bus`; it is then left open. The method names follow bleak's
+where there is an equivalent.
 
 Each call to BlueZ waits at most 10 seconds for an answer, except pairing,
 which has its own timeout. A scan or pairing on a powered-off adapter raises
@@ -35,14 +43,17 @@ one. Requests about any other device are rejected.
 so BlueZ accepts its connections without asking. Some devices drop a
 connection from a host that does not trust them.
 
-## Scanning for one device
+{meth}`~bluetooth_classic.BluetoothClassic.unpair` removes a device from
+BlueZ, forgetting its pairing and trust, as bleak's `unpair()` does on Linux.
 
-{meth}`~bluetooth_classic.BluetoothClassic.scan_for` runs a short Classic
-scan and reports whether a known device answered, and how soon; it stops as
-soon as the device answers. It never connects, so it does not wake a device
-that wakes when connected to. A device answers only while it is on and
-discoverable. Phones and computers usually are not, so this is no way to
-tell whether a person is home.
+## Finding one device
+
+{meth}`~bluetooth_classic.BluetoothClassic.find_device_by_address` scans
+until a device answers and returns it, or `None` if it does not answer in
+time; the scan stops as soon as it answers. It never connects, so it does
+not wake a device that wakes when connected to. A device answers only while
+it is on and discoverable. Phones and computers usually are not, so this is
+no way to tell whether a person is home.
 
 Low Energy advertising and a link changing can also bring a signal strength
 from BlueZ; those are not taken as an answer.

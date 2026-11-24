@@ -25,10 +25,10 @@ AGENT_CAPABILITY: Final = "NoInputNoOutput"
 DEFAULT_PIN: Final = "0000"
 
 # How long a discovery runs by default.
-DISCOVERY_SECONDS: Final = 12.0
-# How long scan_for() waits for a device to answer. A device that is on
+DISCOVERY_TIMEOUT: Final = 12.0
+# How long find_device_by_address() waits for a device to answer. A device that is on
 # and discoverable answers a Classic inquiry within a few seconds.
-SCAN_FOR_SECONDS: Final = 5.0
+FIND_TIMEOUT: Final = 5.0
 # How long pairing may take before it is cancelled.
 PAIR_TIMEOUT: Final = 45.0
 # How long any other call to BlueZ may take. BlueZ answers within a second

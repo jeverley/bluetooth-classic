@@ -46,9 +46,13 @@ asyncio event loop, without compiled extensions.
   strength.
 - **Pair** with a built-in agent for devices without a screen or keyboard,
   and **trust** them.
-- **Scan for a device**: whether a known device is on and discoverable, with
-  a short Classic scan that never connects to it, so it does not wake a
-  device that wakes when connected to.
+- **Find a device**: whether a device is on and discoverable, with a short
+  Classic scan that never connects to it, so it does not wake a device that
+  wakes when connected to.
+- **Unpair** a device, removing it from BlueZ.
+
+Method names follow [bleak](https://github.com/hbldh/bleak)'s where there is
+an equivalent.
 - **Connect** to a device's serial port (RFCOMM) through
   [serialx](https://github.com/puddly/serialx), with `rfcomm://` URLs, and
   find its channel.
@@ -75,15 +79,15 @@ from bluetooth_classic import BluetoothClassic
 
 
 async def main() -> None:
-    async with await BluetoothClassic.connect() as bluetooth:
-        for device in await bluetooth.discover(seconds=10):
+    async with BluetoothClassic() as bluetooth:
+        for device in await bluetooth.discover(timeout=10):
             print(device.address, device.name, device.rssi)
 
         device = await bluetooth.pair("00:11:22:33:44:55")
         await bluetooth.trust(device.address)
 
-        result = await bluetooth.scan_for(device.address)
-        print("on" if result.found else "off")
+        found = await bluetooth.find_device_by_address(device.address)
+        print("on" if found else "off")
 
     # The device's serial port, as a serialx connection.
     reader, writer = await serialx.open_serial_connection(

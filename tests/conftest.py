@@ -146,6 +146,10 @@ class FakeBus:
         properties["UUIDs"] = Variant("as", [A2DP, SPP])
         return self._reply()
 
+    async def _RemoveDevice(self, message: Any) -> SimpleNamespace:
+        self.objects.pop(message.body[0], None)
+        return self._reply()
+
     async def _Set(self, message: Any) -> SimpleNamespace:
         interface, name, value = message.body
         self.objects[message.path][interface][name] = value

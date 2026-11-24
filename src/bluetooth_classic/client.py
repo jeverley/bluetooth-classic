@@ -1,4 +1,4 @@
-"""Bluetooth Classic discovery, pairing and scans for one device, through BlueZ."""
+"""Bluetooth Classic discovery, finding a device and pairing, through BlueZ."""
 
 from __future__ import annotations
 
@@ -27,13 +27,13 @@ from .const import (
     DBUS_SERVICE,
     DEFAULT_PIN,
     DEVICE_INTERFACE,
-    DISCOVERY_SECONDS,
+    DISCOVERY_TIMEOUT,
     ERROR_NOT_READY,
+    FIND_TIMEOUT,
     NOT_INQUIRY,
     OBJECT_MANAGER_INTERFACE,
     PAIR_TIMEOUT,
     PROPERTIES_INTERFACE,
-    SCAN_FOR_SECONDS,
     TRANSPORT_BREDR,
 )
 from .exceptions import (
@@ -42,7 +42,7 @@ from .exceptions import (
     NoAdapterError,
     PairingError,
 )
-from .models import ClassicDevice, ScanResult
+from .models import ClassicDevice
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,17 +61,6 @@ def normalize_address(address: str) -> str:
 
 def _unwrap(value: Any) -> Any:
     return value.value if isinstance(value, Variant) else value
-
-
-def _summary(value: Any) -> Any:
-    """Return a property value short enough to log."""
-    if isinstance(value, bool | int | float | str):
-        return value
-    if isinstance(value, dict):
-        return "{" + ", ".join(str(key) for key in value) + "}"
-    if isinstance(value, list | tuple | bytes | bytearray):
-        return f"[{len(value)}]"
-    return type(value).__name__
 
 
 def _is_inquiry_answer(properties: dict[str, Any]) -> bool:
@@ -104,40 +93,41 @@ def _device(path: str, properties: dict[str, Any]) -> ClassicDevice:
 class BluetoothClassic:
     """A connection to BlueZ for Bluetooth Classic devices on one adapter.
 
-    Use :meth:`connect`, ideally as an async context manager::
+    Use it as an async context manager, as bleak's scanner and client are::
 
-        async with await BluetoothClassic.connect() as bluetooth:
+        async with BluetoothClassic() as bluetooth:
             devices = await bluetooth.discover()
 
-    Discovery and scans for a device on one connection run one at a time.
+    Discovery and finding a device on one connection run one at a time.
     A Classic scan uses the same radio as Low Energy scanning and interrupts
     it while it runs, so keep them short and let one owner schedule them.
     """
 
-    def __init__(self, bus: MessageBus, adapter_path: str, *, owns_bus: bool) -> None:
-        """Wrap a connected bus; use :meth:`connect` instead."""
-        self._bus = bus
-        self._adapter_path = adapter_path
-        self._owns_bus = owns_bus
-        self._scan_lock = asyncio.Lock()
-
-    @classmethod
-    async def connect(
-        cls, adapter: str | None = None, *, bus: MessageBus | None = None
-    ) -> Self:
-        """Connect to BlueZ and choose an adapter.
+    def __init__(
+        self, adapter: str | None = None, *, bus: MessageBus | None = None
+    ) -> None:
+        """Prepare a connection; it opens on entering the ``async with`` block.
 
         Args:
             adapter: The adapter's name, such as ``"hci0"``. ``None`` picks the
                 first powered adapter, or the first adapter if none is powered.
             bus: A system bus connection to use instead of opening one. It is
                 left open when this connection closes.
+        """
+        self._requested_adapter = adapter
+        self._given_bus = bus
+        self._bus: MessageBus | None = None
+        self._adapter_path = ""
+        self._scan_lock = asyncio.Lock()
+
+    async def __aenter__(self) -> Self:
+        """Connect to BlueZ and choose the adapter.
 
         Raises:
             BluetoothClassicError: The system bus could not be reached.
             NoAdapterError: There is no adapter, or not the one asked for.
         """
-        owns_bus = bus is None
+        bus = self._given_bus
         if bus is None:
             try:
                 bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -146,25 +136,13 @@ class BluetoothClassic:
                     f"Could not connect to the system bus: {err}"
                 ) from err
         try:
-            path = _choose_adapter(await _managed_objects(bus), adapter)
+            path = _choose_adapter(await _managed_objects(bus), self._requested_adapter)
         except BaseException:
-            if owns_bus:
+            if self._given_bus is None:
                 bus.disconnect()
             raise
-        return cls(bus, path, owns_bus=owns_bus)
-
-    @property
-    def adapter(self) -> str:
-        """Return the adapter's name, such as ``"hci0"``."""
-        return self._adapter_path.rsplit("/", 1)[-1]
-
-    def close(self) -> None:
-        """Close the connection, unless it was given an existing bus."""
-        if self._owns_bus:
-            self._bus.disconnect()
-
-    async def __aenter__(self) -> Self:
-        """Use as an async context manager."""
+        self._bus = bus
+        self._adapter_path = path
         return self
 
     async def __aexit__(
@@ -173,8 +151,23 @@ class BluetoothClassic:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close on leaving the block."""
-        self.close()
+        """Close the connection, unless it was given an existing bus."""
+        if self._bus is not None and self._given_bus is None:
+            self._bus.disconnect()
+        self._bus = None
+
+    @property
+    def adapter(self) -> str:
+        """Return the adapter's name, such as ``"hci0"``."""
+        self._require_open()
+        return self._adapter_path.rsplit("/", 1)[-1]
+
+    def _require_open(self) -> MessageBus:
+        if self._bus is None:
+            raise BluetoothClassicError(
+                "Not connected to BlueZ; use BluetoothClassic in async with"
+            )
+        return self._bus
 
     async def devices(self, *, service: str | None = None) -> list[ClassicDevice]:
         """Return the devices BlueZ knows on this adapter.
@@ -187,7 +180,9 @@ class BluetoothClassic:
         """
         devices = [
             _device(path, interfaces[DEVICE_INTERFACE])
-            for path, interfaces in (await _managed_objects(self._bus)).items()
+            for path, interfaces in (
+                await _managed_objects(self._require_open())
+            ).items()
             if DEVICE_INTERFACE in interfaces
             and path.startswith(f"{self._adapter_path}/")
         ]
@@ -200,11 +195,12 @@ class BluetoothClassic:
         address = normalize_address(address)
         return next((d for d in await self.devices() if d.address == address), None)
 
-    async def discover(self, seconds: float = DISCOVERY_SECONDS) -> list[ClassicDevice]:
+    async def discover(self, timeout: float = DISCOVERY_TIMEOUT) -> list[ClassicDevice]:
         """Scan for Bluetooth Classic devices and return those that answered.
 
-        Devices that answer become known to BlueZ, so they can be paired.
-        Only discoverable devices answer.
+        Like bleak's ``BleakScanner.discover()``. Devices that answer become
+        known to BlueZ, so they can be paired. Only discoverable devices
+        answer.
 
         Raises:
             NoAdapterError: The adapter is powered off.
@@ -222,7 +218,7 @@ class BluetoothClassic:
             self._listening(on_answer, new_devices=True),
             self._discovery(),
         ):
-            await asyncio.sleep(seconds)
+            await asyncio.sleep(timeout)
         found = []
         for device in await self.devices():
             # A Low Energy device can bring a signal strength alone, without
@@ -236,52 +232,50 @@ class BluetoothClassic:
         _LOGGER.debug("Discovery on %s found %s devices", self.adapter, len(found))
         return found
 
-    async def scan_for(
-        self, address: str, seconds: float = SCAN_FOR_SECONDS
-    ) -> ScanResult:
-        """Return whether a known device answers a short Classic scan.
+    async def find_device_by_address(
+        self, address: str, timeout: float = FIND_TIMEOUT
+    ) -> ClassicDevice | None:
+        """Scan until a device answers, and return it; ``None`` if it does not.
 
-        The scan stops as soon as the device answers. It does not connect to
-        the device, so it does not wake one that wakes when connected to.
+        Like bleak's ``BleakScanner.find_device_by_address()``: the scan stops
+        as soon as the device answers. It does not connect to the device, so
+        it does not wake one that wakes when connected to. The device need not
+        be known to BlueZ beforehand.
 
         A device answers only while it is on and discoverable. Phones and
         computers are usually not discoverable, so this does not tell
         whether a person is home.
 
         Raises:
-            DeviceNotFoundError: BlueZ does not know the device; discover or
-                pair it first.
             NoAdapterError: The adapter is powered off.
         """
-        device = await self.device(address)
-        if device is None:
-            raise DeviceNotFoundError(f"{address} is not known on {self.adapter}")
+        address = normalize_address(address)
+        self._require_open()
+        target = f"{self._adapter_path}/dev_{address.replace(':', '_')}"
         answered = asyncio.Event()
-        changed: dict[str, Any] = {}
+        rssi: list[Any] = []
 
-        def on_change(path: str, properties: dict[str, Any]) -> None:
-            if path != device.path or answered.is_set():
+        def on_answer(path: str, properties: dict[str, Any]) -> None:
+            if path != target or answered.is_set():
                 return
-            for key, value in properties.items():
-                changed[key] = _summary(_unwrap(value))
-            if _is_inquiry_answer(properties):
+            if "Class" in properties or _is_inquiry_answer(properties):
+                rssi.append(_unwrap(properties.get("RSSI")))
                 answered.set()
 
-        loop = asyncio.get_running_loop()
-        async with self._scan_lock, self._listening(on_change, path=device.path):
-            started = loop.time()
-            async with self._discovery():
-                try:
-                    async with asyncio.timeout(seconds):
-                        await answered.wait()
-                except TimeoutError:
-                    return ScanResult(False, linked=device.connected)
-                return ScanResult(
-                    True,
-                    after=loop.time() - started,
-                    changed=changed,
-                    linked=device.connected,
-                )
+        async with (
+            self._scan_lock,
+            self._listening(on_answer, new_devices=True),
+            self._discovery(),
+        ):
+            try:
+                async with asyncio.timeout(timeout):
+                    await answered.wait()
+            except TimeoutError:
+                return None
+        device = await self.device(address)
+        if device is not None and rssi and rssi[0] is not None:
+            device = replace(device, rssi=int(rssi[0]))
+        return device
 
     async def pair(
         self,
@@ -305,7 +299,7 @@ class BluetoothClassic:
         if device.paired:
             return device
         agent = PairingAgent(device.path, pin)
-        self._bus.export(AGENT_PATH, agent)
+        self._require_open().export(AGENT_PATH, agent)
         try:
             await self._call(
                 BLUEZ_PATH,
@@ -340,8 +334,24 @@ class BluetoothClassic:
                 except BluetoothClassicError as err:
                     _LOGGER.debug("Could not unregister the pairing agent: %s", err)
         finally:
-            self._bus.unexport(AGENT_PATH, agent)
+            self._require_open().unexport(AGENT_PATH, agent)
         return await self._known(address)
+
+    async def unpair(self, address: str) -> None:
+        """Remove a device from BlueZ, forgetting its pairing and trust.
+
+        Like bleak's ``BleakClient.unpair()``, which also removes the device
+        on Linux. Nothing happens if BlueZ does not know the device.
+        """
+        device = await self.device(address)
+        if device is not None:
+            await self._call(
+                self._adapter_path,
+                ADAPTER_INTERFACE,
+                "RemoveDevice",
+                "o",
+                [device.path],
+            )
 
     async def trust(self, address: str) -> ClassicDevice:
         """Mark a known device as trusted, if it is not already.
@@ -452,21 +462,27 @@ class BluetoothClassic:
                 callback(message.body[0], message.body[1][DEVICE_INTERFACE])
 
         added: list[str] = []
-        self._bus.add_message_handler(handler)
+        self._require_open().add_message_handler(handler)
         try:
             for rule in rules:
                 await self._bus_call("AddMatch", rule)
                 added.append(rule)
             yield
         finally:
-            self._bus.remove_message_handler(handler)
+            self._require_open().remove_message_handler(handler)
             for rule in added:
                 with contextlib.suppress(BluetoothClassicError):
                     await self._bus_call("RemoveMatch", rule)
 
     async def _bus_call(self, member: str, rule: str) -> None:
         await _call(
-            self._bus, DBUS_SERVICE, DBUS_PATH, DBUS_SERVICE, member, "s", [rule]
+            self._require_open(),
+            DBUS_SERVICE,
+            DBUS_PATH,
+            DBUS_SERVICE,
+            member,
+            "s",
+            [rule],
         )
 
     async def _call(
@@ -480,7 +496,7 @@ class BluetoothClassic:
         timeout: float | None = CALL_TIMEOUT,
     ) -> list[Any]:
         return await _call(
-            self._bus,
+            self._require_open(),
             BLUEZ_SERVICE,
             path,
             interface,

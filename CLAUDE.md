@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 `bluetooth-classic`: Bluetooth Classic (BR/EDR) discovery, pairing, trust
-and scans for one device on Linux, through BlueZ over D-Bus with dbus-fast, and RFCOMM
+and finding one device on Linux, through BlueZ over D-Bus with dbus-fast, and RFCOMM
 serial connections through a serialx `rfcomm://` handler. It holds what
 Classic devices need that Home Assistant's Bluetooth libraries do not, so
 each piece can later move to the library it belongs in (discovery and
@@ -22,6 +22,9 @@ Read the Docs.
 - No device-specific behaviour: callers filter devices themselves. Docs,
   comments and tests use generic devices and example addresses only
   (such as `00:11:22:33:44:55`), never real ones.
+- Method names and parameters follow bleak's where there is an equivalent
+  (`discover(timeout=)`, `find_device_by_address()`, `pair()`, `unpair()`,
+  `async with`).
 - Connections: only the generic `rfcomm://` serialx handler. No device
   protocols; callers bring their own.
 - `agent.py` must not use `from __future__ import annotations`: dbus-fast

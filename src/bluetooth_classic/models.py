@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,19 +31,3 @@ class ClassicDevice:
     def offers(self, service: str) -> bool:
         """Return whether the device lists a service, by its UUID."""
         return service.lower() in self.uuids
-
-
-@dataclass(frozen=True, slots=True)
-class ScanResult:
-    """Whether a device answered a short Classic scan, and how."""
-
-    #: Whether it answered within the time allowed.
-    found: bool
-    #: Seconds until it answered.
-    after: float | None = None
-    #: Device properties BlueZ changed up to the answer, summarised for logs.
-    #: A Classic inquiry answer changes the signal strength (``RSSI``), often
-    #: with ``TxPower``.
-    changed: dict[str, Any] = field(default_factory=dict)
-    #: Whether BlueZ already had a link to the device when the scan began.
-    linked: bool = False
