@@ -1,6 +1,6 @@
 [project]
 name = "bluetooth-classic"
-version = "0.5.0"
+version = "0.6.0"
 license = "Apache-2.0"
 description = "Bluetooth Classic (BR/EDR) discovery, pairing, scans and RFCOMM serial connections on Linux"
 authors = [{ name = "jeverley", email = "46714706+jeverley@users.noreply.github.com" }]

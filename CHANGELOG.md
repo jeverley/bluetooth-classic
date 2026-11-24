@@ -1,6 +1,49 @@
 # CHANGELOG
 
 
+## v0.6.0 (2026-11-24)
+
+### Bug Fixes
+
+- Drop stray BlueZ links, keep links to other devices, bound the open
+  ([`67ffd29`](https://github.com/jeverley/bluetooth-classic/commit/67ffd29ce478d4ece520a62d451043b5b7e9ee5a))
+
+- A socket BlueZ hands over after the connect was given up is closed without writing to it, and
+  BlueZ is asked to drop the link too. - One link per device and service in a process: a second,
+  while the first is open or opening, is refused instead of tearing down the first. -
+  connect_timeout bounds the whole open, registration and lookups included. - Registrations are tied
+  to the bus they were made on, so links opened before a D-Bus reconnect cannot release a newer
+  registration. - Background DisconnectProfile calls are kept until they finish, and the
+  ConnectProfile reply is always collected. - Without adapter=, a device under a powered adapter is
+  preferred. - The docs say link security is BlueZ's for client profiles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Features
+
+- Connect RFCOMM services through BlueZ's profile API
+  ([`686e65b`](https://github.com/jeverley/bluetooth-classic/commit/686e65b5f878b3ce91033ac158b56388bf289fbd))
+
+The rfcomm:// handler no longer opens Bluetooth sockets of its own: it registers as a client of the
+  service with BlueZ (only while a link uses it), asks BlueZ to connect it on the device, and takes
+  the socket BlueZ hands over in Profile1.NewConnection, writing write_on_connect inside that call.
+  When a link closes it asks BlueZ to drop its side as well, as BlueZ keeps its own reference to the
+  connection. Links in one process share a registration; another program holding the service raises
+  ProfileInUseError, and BlueZ failing to connect raises RfcommConnectError (an OSError).
+
+URLs take service and adapter only: BlueZ finds the channel, so channel= and the channel hint are
+  gone, as is security=. Only serialx's asyncio API opens rfcomm:// URLs; serial_for_url() refuses
+  them. Our own SDP client (find_rfcomm_services, find_rfcomm_channel), Security,
+  rfcomm_supported(), RfcommUnsupportedError and ServiceLookupError are removed. open_rfcomm() takes
+  service= (required) and adapter=.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.5.0 (2026-11-24)
 
 ### Bug Fixes
