@@ -340,7 +340,8 @@ async def test_cancelling_a_connect_closes_the_socket_after_the_thread() -> None
 
 
 async def test_cancelling_as_the_open_finishes_closes_the_socket() -> None:
-    returned = threading.Event()
+    started = threading.Event()
+    go = threading.Event()
     closed = threading.Event()
 
     class _Socket:
@@ -348,7 +349,8 @@ async def test_cancelling_as_the_open_finishes_closes_the_socket() -> None:
             closed.set()
 
     def quick_open(*args: object) -> tuple[_Socket, RfcommLink]:
-        returned.set()
+        started.set()
+        go.wait(5)
         return _Socket(), RfcommLink(ADDRESS, 1, None, None)
 
     loop = asyncio.get_running_loop()
@@ -359,10 +361,14 @@ async def test_cancelling_as_the_open_finishes_closes_the_socket() -> None:
         task = asyncio.ensure_future(
             serialx.create_serial_connection(loop, _Recorder, URL, baudrate=9600)
         )
-        await asyncio.sleep(0)
-        # The thread has finished and posted its result, but the loop has not
-        # run since: the cancel lands before the task sees the socket.
-        assert returned.wait(5)
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        # Let the thread finish and post its result without running the loop:
+        # the cancel lands before the task sees the socket.
+        go.set()
         time.sleep(0.1)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
