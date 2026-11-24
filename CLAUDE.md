@@ -27,6 +27,12 @@ Read the Docs.
   `async with`).
 - Connections: only the generic `rfcomm://` serialx handler. No device
   protocols; callers bring their own.
+- The `rfcomm://` handler keeps no state between connections (no channel
+  cache): callers keep the channel a link reports and pass it back as a
+  hint. Links say which adapter they are on, and are listed while open, so
+  they can later be shown alongside Home Assistant's Bluetooth devices
+  and connections.
+- Service lookups are our own SDP client (`sdp.py`), not `sdptool`.
 - `agent.py` must not use `from __future__ import annotations`: dbus-fast
   reads the D-Bus signatures from the method annotations.
 - Before committing: `ruff check .`, `ruff format --check .`, `mypy src

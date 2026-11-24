@@ -89,9 +89,10 @@ async def main() -> None:
         found = await bluetooth.find_device_by_address(device.address)
         print("on" if found else "off")
 
-    # The device's serial port, as a serialx connection.
+    # The device's Serial Port service (0x1101), as a serialx connection:
+    # its channel is looked up in the device's SDP records.
     reader, writer = await serialx.open_serial_connection(
-        "rfcomm://00:11:22:33:44:55?channel=1", baudrate=9600
+        "rfcomm://00:11:22:33:44:55?service=1101", baudrate=9600
     )
 
 

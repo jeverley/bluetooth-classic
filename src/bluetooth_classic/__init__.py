@@ -10,16 +10,29 @@ from .exceptions import (
     NoAdapterError,
     PairingError,
     RfcommUnsupportedError,
+    ServiceLookupError,
 )
 from .models import ClassicDevice
 from .rfcomm import (
+    RfcommLink,
+    RfcommTarget,
     Security,
+    on_rfcomm_links_changed,
     open_rfcomm,
+    open_rfcomm_links,
     parse_rfcomm_url,
     rfcomm_supported,
     rfcomm_url,
 )
-from .sdp import SERIAL_PORT, find_rfcomm_channel
+from .sdp import (
+    SERIAL_PORT,
+    RfcommService,
+    find_rfcomm_channel,
+    find_rfcomm_channel_blocking,
+    find_rfcomm_services,
+    find_rfcomm_services_blocking,
+    service_uuid,
+)
 
 __all__ = [
     "DEFAULT_PIN",
@@ -33,12 +46,22 @@ __all__ = [
     "DeviceNotFoundError",
     "NoAdapterError",
     "PairingError",
+    "RfcommLink",
+    "RfcommService",
+    "RfcommTarget",
     "RfcommUnsupportedError",
     "Security",
+    "ServiceLookupError",
     "find_rfcomm_channel",
+    "find_rfcomm_channel_blocking",
+    "find_rfcomm_services",
+    "find_rfcomm_services_blocking",
     "normalize_address",
+    "on_rfcomm_links_changed",
     "open_rfcomm",
+    "open_rfcomm_links",
     "parse_rfcomm_url",
     "rfcomm_supported",
     "rfcomm_url",
+    "service_uuid",
 ]

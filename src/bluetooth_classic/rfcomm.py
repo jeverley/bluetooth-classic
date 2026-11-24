@@ -1,18 +1,32 @@
 """A serialx handler for Bluetooth Classic RFCOMM: ``rfcomm://`` URLs.
 
-``rfcomm://00:11:22:33:44:55?channel=1`` opens RFCOMM channel 1 of that
-device as a serial connection, with Python's own Bluetooth sockets.
+RFCOMM carries a device's serial-style services, each on its own channel
+(1 to 30). A URL names the device and the service, the channel, or both:
 
-``security`` asks Linux for a level of link security:
-``rfcomm://00:11:22:33:44:55?channel=1&security=medium``. ``low`` is
-Linux's default; ``medium`` needs an authenticated (paired) and encrypted
-link; ``high`` also needs a PIN or passkey to have been used. Without it,
-Linux's default is left alone.
+- ``rfcomm://00:11:22:33:44:55?service=1101`` looks the Serial Port
+  service's channel up in the device's SDP records, then connects to it.
+- ``rfcomm://00:11:22:33:44:55?channel=1`` connects to channel 1.
+- ``rfcomm://00:11:22:33:44:55?service=1101&channel=1`` connects to
+  channel 1, and if the device refuses it, looks the service up once and
+  connects to the channel found. Callers that keep the channel a
+  connection used (``get_extra_info("rfcomm_channel")``) pass it this way
+  next time, so a lookup, itself a short connection, is only made when
+  needed.
+
+``service`` is a UUID, or its 16- or 32-bit short form. ``adapter`` (such
+as ``hci0``) chooses the local adapter. ``security`` asks Linux for a
+level of link security: ``low`` is Linux's default; ``medium`` needs an
+authenticated (paired) and encrypted link; ``high`` also needs a PIN or
+passkey to have been used. Without it, Linux's default is left alone.
 
 The link is opened in a worker thread. Bytes given as ``write_on_connect``
 are written by that thread the moment the link opens, without waiting for
 the event loop: some devices change state soon after a connection opens
 and only answer a request sent before then.
+
+An open link reports the channel, service and adapter it used through
+``get_extra_info()`` (``rfcomm_channel``, ``rfcomm_service``,
+``rfcomm_adapter``), and is listed by :func:`open_rfcomm_links` while open.
 
 Importing this module (or ``bluetooth_classic``) registers the handler, so
 ``serialx.create_serial_connection()`` and ``serialx.serial_for_url()``
@@ -29,12 +43,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import socket
 import struct
+import threading
+import time
 import urllib.parse
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
+from uuid import UUID
 
 from serialx import (
     BaseSerial,
@@ -46,7 +65,13 @@ from serialx import (
 from serialx.platforms.serial_socket import SocketSerial, SocketSerialTransport
 
 from .client import normalize_address
-from .exceptions import RfcommUnsupportedError
+from .exceptions import RfcommUnsupportedError, ServiceLookupError
+from .sdp import (
+    adapter_address,
+    adapter_name,
+    find_rfcomm_channel_blocking,
+    service_uuid,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +82,8 @@ DEFAULT_CONNECT_TIMEOUT = 10.0
 SOL_BLUETOOTH = 274
 BT_SECURITY = 4
 
+_ADAPTER_RE = re.compile(r"hci\d+")
+
 
 class Security(IntEnum):
     """Link security levels, as Linux numbers them (BT_SECURITY_*)."""
@@ -66,44 +93,174 @@ class Security(IntEnum):
     HIGH = 3
 
 
+@dataclass(frozen=True, slots=True)
+class RfcommTarget:
+    """What an ``rfcomm://`` URL connects to."""
+
+    address: str
+    #: The service to look up the channel of.
+    service: UUID | None = None
+    #: The channel to try first, or only, if no service is given.
+    channel: int | None = None
+    security: Security | None = None
+    #: The local adapter, such as ``hci0``; ``None`` lets Linux choose.
+    adapter: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RfcommLink:
+    """An open RFCOMM link."""
+
+    address: str
+    channel: int
+    #: The adapter it is on, such as ``hci0``, if known.
+    adapter: str | None
+    #: The service it was opened for, if one was given.
+    service: UUID | None
+    #: When it opened, in ``time.monotonic()`` seconds.
+    since: float = field(default_factory=time.monotonic)
+
+
 def rfcomm_supported() -> bool:
     """Return whether this Python can open RFCOMM sockets."""
     return hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_RFCOMM")
 
 
-def rfcomm_url(address: str, channel: int, security: Security | None = None) -> str:
-    """Return the ``rfcomm://`` URL of a device's RFCOMM channel."""
-    url = f"{SCHEME}{normalize_address(address)}?channel={channel}"
-    if security is not None:
-        url += f"&security={security.name.lower()}"
-    return url
-
-
-def parse_rfcomm_url(url: str) -> tuple[str, int, Security | None]:
-    """Return the address, channel and security of an ``rfcomm://`` URL.
-
-    A Bluetooth address has colons, so the URL cannot be parsed as host and
-    port; the channel is a query parameter instead.
+def rfcomm_url(
+    address: str,
+    *,
+    service: UUID | str | int | None = None,
+    channel: int | None = None,
+    security: Security | None = None,
+    adapter: str | None = None,
+) -> str:
+    """Return the ``rfcomm://`` URL of a device's service or channel.
 
     Raises:
-        ValueError: Not an ``rfcomm://`` URL with an address, a channel from
-            1 to 30, and at most one known security level.
+        ValueError: Neither a service nor a channel, or one not valid.
+    """
+    target = RfcommTarget(
+        normalize_address(address),
+        None if service is None else service_uuid(service),
+        channel,
+        security,
+        adapter,
+    )
+    _check(target, repr(target))
+    params: dict[str, str] = {}
+    if target.service is not None:
+        params["service"] = str(target.service)
+    if channel is not None:
+        params["channel"] = str(channel)
+    if security is not None:
+        params["security"] = security.name.lower()
+    if adapter is not None:
+        params["adapter"] = adapter
+    return f"{SCHEME}{target.address}?{urllib.parse.urlencode(params)}"
+
+
+def parse_rfcomm_url(url: str) -> RfcommTarget:
+    """Return what an ``rfcomm://`` URL connects to.
+
+    A Bluetooth address has colons, so the URL cannot be parsed as host and
+    port; the rest are query parameters instead.
+
+    Raises:
+        ValueError: Not an ``rfcomm://`` URL with an address and a service
+            or a channel from 1 to 30, each parameter given at most once and
+            valid.
     """
     if not url.startswith(SCHEME):
         raise ValueError(f"Not an rfcomm:// URL: {url}")
     address, _, query = url.removeprefix(SCHEME).partition("?")
     params = urllib.parse.parse_qs(query)
-    channels = params.get("channel", [])
-    if len(channels) != 1 or not channels[0].isdigit():
-        raise ValueError(f"rfcomm:// URL needs one channel: {url}")
-    channel = int(channels[0])
-    if not 1 <= channel <= 30:
-        raise ValueError(f"RFCOMM channels are 1 to 30: {url}")
-    levels = params.get("security", [])
-    if len(levels) > 1 or (levels and levels[0].upper() not in Security.__members__):
+    for name, values in params.items():
+        if name not in ("service", "channel", "security", "adapter"):
+            raise ValueError(f"Unknown rfcomm:// parameter {name}: {url}")
+        if len(values) != 1:
+            raise ValueError(f"rfcomm:// {name} given more than once: {url}")
+    value = {name: values[0] for name, values in params.items()}
+    try:
+        service = service_uuid(value["service"]) if "service" in value else None
+    except ValueError as err:
+        raise ValueError(f"rfcomm:// service is not a UUID: {url}") from err
+    channel = value.get("channel")
+    if channel is not None and not channel.isdigit():
+        raise ValueError(f"rfcomm:// channel is a number: {url}")
+    level = value.get("security")
+    if level is not None and level.upper() not in Security.__members__:
         raise ValueError(f"rfcomm:// security is low, medium or high: {url}")
-    security = Security[levels[0].upper()] if levels else None
-    return normalize_address(address), channel, security
+    target = RfcommTarget(
+        normalize_address(address),
+        service,
+        None if channel is None else int(channel),
+        None if level is None else Security[level.upper()],
+        value.get("adapter"),
+    )
+    _check(target, url)
+    return target
+
+
+def _check(target: RfcommTarget, url: str) -> None:
+    if target.service is None and target.channel is None:
+        raise ValueError(f"rfcomm:// needs a service or a channel: {url}")
+    if target.channel is not None and not 1 <= target.channel <= 30:
+        raise ValueError(f"RFCOMM channels are 1 to 30: {url}")
+    if target.adapter is not None and not _ADAPTER_RE.fullmatch(target.adapter):
+        raise ValueError(f"rfcomm:// adapter is a name such as hci0: {url}")
+
+
+# The link registry.
+
+_links: dict[int, RfcommLink] = {}
+_links_lock = threading.Lock()
+_listeners: list[Callable[[], None]] = []
+
+
+def open_rfcomm_links() -> list[RfcommLink]:
+    """Return the RFCOMM links this process has open through the handler."""
+    with _links_lock:
+        return list(_links.values())
+
+
+def on_rfcomm_links_changed(callback: Callable[[], None]) -> Callable[[], None]:
+    """Call ``callback`` whenever a link opens or closes; returns an unsubscribe.
+
+    It is called in the thread that opened or closed the link: the event
+    loop's for connections made with ``open_rfcomm()`` or serialx's async
+    API.
+    """
+    _listeners.append(callback)
+
+    def unsubscribe() -> None:
+        if callback in _listeners:
+            _listeners.remove(callback)
+
+    return unsubscribe
+
+
+def _add_link(key: int, link: RfcommLink) -> None:
+    with _links_lock:
+        _links[key] = link
+    _notify()
+
+
+def _remove_link(key: int) -> None:
+    with _links_lock:
+        if _links.pop(key, None) is None:
+            return
+    _notify()
+
+
+def _notify() -> None:
+    for listener in list(_listeners):
+        try:
+            listener()
+        except Exception:
+            _LOGGER.exception("RFCOMM link listener failed")
+
+
+# Opening links.
 
 
 def _rfcomm_socket(security: Security | None) -> socket.socket:
@@ -130,25 +287,102 @@ def _rfcomm_socket(security: Security | None) -> socket.socket:
     return sock
 
 
-def _connect_and_write(
-    sock: socket.socket,
-    address: str,
-    channel: int,
-    timeout: float | None,
-    write_on_connect: bytes,
-) -> None:
-    """Connect, then write write_on_connect at once; runs in a worker thread."""
-    sock.settimeout(timeout)
-    sock.connect((address, channel))
-    if write_on_connect:
-        sock.sendall(write_on_connect)
+def _connect(
+    target: RfcommTarget, channel: int, timeout: float | None
+) -> socket.socket:
+    """Return a socket connected to one channel."""
+    sock = _rfcomm_socket(target.security)
+    try:
+        sock.settimeout(timeout)
+        if target.adapter is not None:
+            sock.bind((adapter_address(target.adapter), 0))
+        sock.connect((target.address, channel))
+    except BaseException:
+        sock.close()
+        raise
+    return sock
 
 
-def _close_after(job: asyncio.Future[None], sock: socket.socket) -> None:
-    """Close the socket of an abandoned connect once its thread is done."""
-    if not job.cancelled() and (err := job.exception()) is not None:
+def _look_up(target: RfcommTarget, timeout: float | None) -> int:
+    """Return the channel of the target's service."""
+    assert target.service is not None
+    channel = find_rfcomm_channel_blocking(
+        target.address,
+        target.service,
+        adapter=target.adapter,
+        timeout=10.0 if timeout is None else timeout,
+    )
+    if channel is None:
+        raise ServiceLookupError(
+            f"{target.address} does not offer service {target.service}"
+        )
+    _LOGGER.debug(
+        "%s offers service %s on channel %s", target.address, target.service, channel
+    )
+    return channel
+
+
+def _open_link(
+    target: RfcommTarget, timeout: float | None, write_on_connect: bytes
+) -> tuple[socket.socket, int]:
+    """Open the link and write write_on_connect at once; runs in a worker thread.
+
+    Returns the connected socket and the channel it is on. ``timeout``
+    bounds the whole open, a lookup included.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def remaining() -> float | None:
+        return None if deadline is None else max(deadline - time.monotonic(), 0.1)
+
+    looked_up = target.channel is None
+    channel = _look_up(target, remaining()) if looked_up else target.channel
+    assert channel is not None
+    try:
+        sock = _connect(target, channel, remaining())
+    except ConnectionRefusedError:
+        # Nothing listens on the channel given: the device may have moved
+        # the service. Look it up once.
+        if looked_up or target.service is None:
+            raise
+        _LOGGER.debug(
+            "%s refused channel %s; looking up service %s",
+            target.address,
+            channel,
+            target.service,
+        )
+        found = _look_up(target, remaining())
+        if found == channel:
+            raise
+        channel = found
+        sock = _connect(target, channel, remaining())
+    try:
+        if write_on_connect:
+            sock.sendall(write_on_connect)
+    except BaseException:
+        sock.close()
+        raise
+    return sock, channel
+
+
+def _link(target: RfcommTarget, sock: socket.socket, channel: int) -> RfcommLink:
+    """Describe a newly opened link."""
+    try:
+        local = sock.getsockname()[0]
+    except (OSError, IndexError, TypeError):
+        local = None
+    adapter = target.adapter or (adapter_name(local) if local else None)
+    return RfcommLink(target.address, channel, adapter, target.service)
+
+
+def _close_after(job: asyncio.Future[tuple[socket.socket, int]]) -> None:
+    """Close the socket of an abandoned open once its thread is done."""
+    if job.cancelled():
+        return
+    if (err := job.exception()) is not None:
         _LOGGER.debug("Abandoned connection attempt ended: %r", err)
-    sock.close()
+        return
+    job.result()[0].close()
 
 
 class RfcommSerial(SocketSerial):
@@ -164,26 +398,27 @@ class RfcommSerial(SocketSerial):
         """Initialise from an ``rfcomm://`` URL; the baud rate is ignored."""
         # SocketSerial's own initialiser parses a host and port.
         BaseSerial.__init__(self, *args, **kwargs)
-        self._address, self._channel, self._security = parse_rfcomm_url(str(self._path))
+        self._target = parse_rfcomm_url(str(self._path))
         self._connect_timeout = connect_timeout
         self._write_on_connect = bytes(write_on_connect)
         self._socket: socket.socket | None = None
+        #: The link while open.
+        self.link: RfcommLink | None = None
 
     def _open(self) -> None:
         """Open the link and write write_on_connect."""
-        sock = _rfcomm_socket(self._security)
-        try:
-            _connect_and_write(
-                sock,
-                self._address,
-                self._channel,
-                self._connect_timeout,
-                self._write_on_connect,
-            )
-        except BaseException:
-            sock.close()
-            raise
+        sock, channel = _open_link(
+            self._target, self._connect_timeout, self._write_on_connect
+        )
         self._socket = sock
+        self.link = _link(self._target, sock, channel)
+        _add_link(id(self), self.link)
+
+    def _close(self) -> None:
+        """Close the link."""
+        super()._close()
+        self.link = None
+        _remove_link(id(self))
 
 
 class _RfcommProxyProtocol(asyncio.Protocol):
@@ -250,32 +485,37 @@ class RfcommSerialTransport(SocketSerialTransport):
         self._extra["serial"] = serial
         self._tcp_connection_lost_waiter = self._loop.create_future()
 
-        sock = _rfcomm_socket(serial._security)
+        target = serial._target
+        # Fails here, not in the thread, when Python has no Bluetooth sockets.
+        if not rfcomm_supported():
+            raise RfcommUnsupportedError(
+                "This Python was built without Bluetooth socket support"
+            )
         job = self._loop.run_in_executor(
-            None,
-            _connect_and_write,
-            sock,
-            serial._address,
-            serial._channel,
-            connect_timeout,
-            serial._write_on_connect,
+            None, _open_link, target, connect_timeout, serial._write_on_connect
         )
         try:
-            # Shielded: cancelling must not close the socket under the thread.
-            await asyncio.shield(job)
+            # Shielded: a cancelled open is left to finish, then closed.
+            sock, channel = await asyncio.shield(job)
+        except BaseException:
+            if not job.done():
+                job.add_done_callback(_close_after)
+            raise
+        try:
+            link = _link(target, sock, channel)
             sock.setblocking(False)
             transport, _ = await self._loop.create_connection(
                 lambda: _RfcommProxyProtocol(self), sock=sock
             )
         except BaseException:
-            if job.done():
-                sock.close()
-            else:
-                # Cancelled while the thread still uses the socket: close it
-                # once the thread has finished with it.
-                job.add_done_callback(lambda done: _close_after(done, sock))
+            sock.close()
             raise
         self._tcp_transport = transport
+        self._extra.update(
+            rfcomm_channel=channel,
+            rfcomm_service=target.service,
+            rfcomm_adapter=link.adapter,
+        )
 
         if self._connection_lost_called:
             # The device dropped the link before the protocol was attached:
@@ -287,6 +527,7 @@ class RfcommSerialTransport(SocketSerialTransport):
                 "The device closed the connection as it opened"
             )
 
+        _add_link(id(self), link)
         self._connection_made()
 
     def _connection_made(self) -> None:
@@ -298,6 +539,7 @@ class RfcommSerialTransport(SocketSerialTransport):
 
     def _connection_lost(self, exc: Exception | None) -> None:
         """Note why the link dropped if the protocol was not attached yet."""
+        _remove_link(id(self))
         if not self._connection_made_called and exc is not None:
             self._lost_before_attached = exc
         super()._connection_lost(exc)
@@ -332,36 +574,52 @@ _register()
 
 async def open_rfcomm(
     address: str,
-    channel: int,
     protocol_factory: Callable[[], asyncio.Protocol],
     *,
+    service: UUID | str | int | None = None,
+    channel: int | None = None,
+    adapter: str | None = None,
     timeout: float | None = DEFAULT_CONNECT_TIMEOUT,
     write_on_connect: bytes = b"",
     security: Security | None = None,
 ) -> tuple[asyncio.Transport, asyncio.Protocol]:
-    """Open an RFCOMM channel through serialx and attach a protocol to it.
+    """Open an RFCOMM service or channel through serialx; attach a protocol.
 
     A shortcut for ``serialx.create_serial_connection()`` with an
-    ``rfcomm://`` URL.
+    ``rfcomm://`` URL. The transport's ``get_extra_info("rfcomm_channel")``
+    is the channel used, to pass as ``channel`` next time.
 
     Args:
         address: The device's address.
-        channel: The RFCOMM channel, 1 to 30.
         protocol_factory: Returns the protocol to attach.
-        timeout: Seconds to wait for the link to open.
+        service: The service to connect to; its channel is looked up if no
+            channel is given, or if the device refuses the one given.
+        channel: The RFCOMM channel to connect to, 1 to 30.
+        adapter: The local adapter, such as ``hci0``; ``None`` lets Linux
+            choose.
+        timeout: Seconds to wait for the link to open, a lookup included.
         write_on_connect: Bytes written the moment the link opens, before the
             protocol is attached. Replies wait until it is.
         security: The link security to ask for; ``None`` leaves Linux's
             default.
 
     Raises:
+        ValueError: Neither a service nor a channel, or one not valid.
         RfcommUnsupportedError: This Python cannot open RFCOMM sockets.
+        ServiceLookupError: The service's channel could not be looked up, or
+            the device does not offer it.
         OSError: The link could not be opened.
     """
     return await create_serial_connection(
         asyncio.get_running_loop(),
         protocol_factory,
-        rfcomm_url(address, channel, security),
+        rfcomm_url(
+            address,
+            service=service,
+            channel=channel,
+            security=security,
+            adapter=adapter,
+        ),
         baudrate=9600,  # Required by serialx; RFCOMM has no baud rate.
         connect_timeout=timeout,
         write_on_connect=write_on_connect,
