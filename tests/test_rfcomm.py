@@ -6,6 +6,7 @@ import asyncio
 import io
 import socket
 import sys
+import time
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
@@ -82,8 +83,11 @@ async def _open(url: str = URL, **kwargs: Any) -> tuple[Any, _Recorder]:
 
 
 async def _settle() -> None:
-    for _ in range(5):
-        await asyncio.sleep(0)
+    """Let pending work finish, here and on the D-Bus thread."""
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if not rfcomm._releasing and not profile_module._tasks:
+            return
 
 
 def test_service_uuids() -> None:
@@ -317,6 +321,41 @@ async def test_a_registration_from_an_older_bus_is_not_counted(
         await _settle()
         assert newer.profiles == {}
     newer.close()
+
+
+async def test_the_request_goes_out_while_the_caller_is_busy(bluez: FakeBus) -> None:
+    bluez.handover_delay = 0.05
+    task = asyncio.ensure_future(_open(write_on_connect=REQUEST))
+    await asyncio.sleep(0.01)
+    # The caller's event loop is blocked (Home Assistant starting up) while
+    # BlueZ hands the connection over.
+    time.sleep(0.3)
+    [device] = bluez.device_ends
+    device.setblocking(False)
+    # Already written, by the D-Bus thread, before the caller's loop ran again.
+    assert device.recv(64) == REQUEST
+    transport, protocol = await task
+    transport.close()
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+
+
+async def test_a_connect_given_up_midway_is_released(bluez: FakeBus) -> None:
+    bluez.handover_delay = 0.1
+    task = asyncio.ensure_future(_open())
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):
+        if bluez.device_ends and not bluez.profiles:
+            break
+        await asyncio.sleep(0.01)
+    # The link it opened anyway was closed, and BlueZ asked to drop it.
+    device = bluez.device_ends[0]
+    device.settimeout(1)
+    assert device.recv(1) == b""
+    assert bluez.profiles == {}
+    assert "DisconnectProfile" in bluez.members()[-3:]
 
 
 async def test_bytes_before_connection_made_are_held() -> None:

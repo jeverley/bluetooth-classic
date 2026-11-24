@@ -32,6 +32,8 @@ Read the Docs.
   while in use, `ConnectProfile`, write `write_on_connect` inside
   `Profile1.NewConnection`, and `DisconnectProfile` when the link closes
   (BlueZ keeps its own reference; without it the next connect hangs).
+  All D-Bus work for it runs on its own event loop in a background
+  thread, so the write happens however busy the caller's loop is.
   No raw Bluetooth sockets, no SDP of our own, no channel-only URLs, and
   only serialx's asyncio API. Links say which adapter they are on, and are
   listed while open, so they can later be shown alongside Home Assistant's

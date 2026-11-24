@@ -16,6 +16,12 @@ BlueZ accepts one registration per service UUID, so while this process holds
 one, other programs cannot connect to that service through BlueZ (as found by
 others on BlueZ 5.72 and 5.85; unconfirmed here). Registering only while in
 use keeps that short.
+
+All D-Bus work runs on an event loop of its own, in a background thread, so
+BlueZ's ``NewConnection`` call is handled, and the bytes to send written, the
+moment it arrives, however busy the caller's event loop is. Some devices
+change state a fraction of a second after a connection opens, and a busy
+caller's loop (Home Assistant starting up) could otherwise write too late.
 """
 
 # Do not add ``from __future__ import annotations``: dbus-fast reads the
@@ -24,9 +30,11 @@ use keeps that short.
 # ruff: noqa: N802
 
 import asyncio
+import concurrent.futures
 import itertools
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -275,6 +283,36 @@ class _Profiles:
 _profiles = _Profiles()
 
 
+class _BusLoop:
+    """The event loop, in a background thread, that all D-Bus work runs on."""
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock = threading.Lock()
+
+    def get(self) -> asyncio.AbstractEventLoop:
+        """Return the loop, starting its thread on first use."""
+        with self._lock:
+            if self._loop is None:
+                loop = asyncio.new_event_loop()
+                ready = threading.Event()
+
+                def run() -> None:
+                    asyncio.set_event_loop(loop)
+                    loop.call_soon(ready.set)
+                    loop.run_forever()
+
+                threading.Thread(
+                    target=run, name="bluetooth-classic D-Bus", daemon=True
+                ).start()
+                ready.wait()
+                self._loop = loop
+            return self._loop
+
+
+_bus_loop = _BusLoop()
+
+
 async def _device_path(bus: MessageBus, address: str, adapter: str | None) -> str:
     """Return the object path of a device BlueZ knows, on the adapter asked for."""
     try:
@@ -331,6 +369,12 @@ class ProfileLink:
 
     async def release(self) -> None:
         """Drop BlueZ's side of the closed link, and the registration once unused."""
+        await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._release(), _bus_loop.get())
+        )
+
+    async def _release(self) -> None:
+        # On the D-Bus loop.
         if self._released:
             return
         self._released = True
@@ -353,7 +397,9 @@ async def connect_profile(
     """Have BlueZ connect a device's service and hand over the socket.
 
     The caller owns the socket and must call ``ProfileLink.release()`` once
-    the link has closed. ``timeout`` bounds the whole open.
+    the link has closed. ``timeout`` bounds the whole open. The work runs on
+    the D-Bus loop; cancelling this leaves it to finish there (within
+    ``timeout``), and a link it opens is then closed and released.
 
     Raises:
         ProfileInUseError: Another program has registered the service.
@@ -361,11 +407,42 @@ async def connect_profile(
             has a link to the device's service, open or opening.
         TimeoutError: No connection within ``timeout`` seconds.
     """
-    async with asyncio.timeout(timeout):
+    future = asyncio.run_coroutine_threadsafe(
+        _connect_profile(address, service, adapter, timeout, write_on_connect),
+        _bus_loop.get(),
+    )
+    try:
+        # Shielded: the work on the D-Bus loop is not cancelled midway.
+        return await asyncio.shield(asyncio.wrap_future(future))
+    except asyncio.CancelledError:
+        future.add_done_callback(_release_abandoned)
+        raise
+
+
+def _release_abandoned(future: concurrent.futures.Future[ProfileLink]) -> None:
+    """Close and release a link whose caller stopped waiting for it."""
+    if future.cancelled() or future.exception() is not None:
+        return
+    link = future.result()
+    os.close(link.handover.fd)
+    _bus_loop.get().call_soon_threadsafe(lambda: _spawn(link._release()))
+
+
+async def _connect_profile(
+    address: str,
+    service: str,
+    adapter: str | None,
+    timeout: float | None,
+    write_on_connect: bytes,
+) -> ProfileLink:
+    """Connect, on the D-Bus loop."""
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    async with asyncio.timeout_at(deadline):
         registration = await _profiles.acquire(service)
     device_path: str | None = None
     try:
-        async with asyncio.timeout(timeout):
+        async with asyncio.timeout_at(deadline):
             bus = registration.bus
             device_path = await _device_path(bus, address, adapter)
             if device_path in registration.devices:

@@ -116,6 +116,10 @@ process share the registration. A process has at most one link to a
 device's service at a time: opening a second, while the first is open or
 opening, raises {class}`~bluetooth_classic.RfcommConnectError`.
 
+The D-Bus side runs on an event loop of its own, in a background thread, so
+BlueZ's handover is handled the moment it arrives, however busy the
+application's event loop is.
+
 Two connection options are also accepted: `connect_timeout`, which bounds
 the whole open, and
 `write_on_connect`, bytes written the moment BlueZ hands the connection
