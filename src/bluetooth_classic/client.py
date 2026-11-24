@@ -1,4 +1,4 @@
-"""Bluetooth Classic discovery, pairing and presence through BlueZ."""
+"""Bluetooth Classic discovery, pairing and scans for one device, through BlueZ."""
 
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ from .const import (
     NOT_INQUIRY,
     OBJECT_MANAGER_INTERFACE,
     PAIR_TIMEOUT,
-    PRESENCE_SECONDS,
     PROPERTIES_INTERFACE,
+    SCAN_FOR_SECONDS,
     TRANSPORT_BREDR,
 )
 from .exceptions import (
@@ -42,7 +42,7 @@ from .exceptions import (
     NoAdapterError,
     PairingError,
 )
-from .models import ClassicDevice, PresenceResult
+from .models import ClassicDevice, ScanResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class BluetoothClassic:
         async with await BluetoothClassic.connect() as bluetooth:
             devices = await bluetooth.discover()
 
-    Discovery and presence checks on one connection run one at a time.
+    Discovery and scans for a device on one connection run one at a time.
     A Classic scan uses the same radio as Low Energy scanning and interrupts
     it while it runs, so keep them short and let one owner schedule them.
     """
@@ -236,14 +236,17 @@ class BluetoothClassic:
         _LOGGER.debug("Discovery on %s found %s devices", self.adapter, len(found))
         return found
 
-    async def check_presence(
-        self, address: str, seconds: float = PRESENCE_SECONDS
-    ) -> PresenceResult:
+    async def scan_for(
+        self, address: str, seconds: float = SCAN_FOR_SECONDS
+    ) -> ScanResult:
         """Return whether a known device answers a short Classic scan.
 
-        This does not connect to the device, so it does not wake one that
-        wakes when connected to. A device answers only while it is on and
-        discoverable.
+        The scan stops as soon as the device answers. It does not connect to
+        the device, so it does not wake one that wakes when connected to.
+
+        A device answers only while it is on and discoverable. Phones and
+        computers are usually not discoverable, so this does not tell
+        whether a person is home.
 
         Raises:
             DeviceNotFoundError: BlueZ does not know the device; discover or
@@ -272,8 +275,8 @@ class BluetoothClassic:
                     async with asyncio.timeout(seconds):
                         await answered.wait()
                 except TimeoutError:
-                    return PresenceResult(False, linked=device.connected)
-                return PresenceResult(
+                    return ScanResult(False, linked=device.connected)
+                return ScanResult(
                     True,
                     after=loop.time() - started,
                     changed=changed,

@@ -1,9 +1,9 @@
-"""Bluetooth Classic discovery, pairing, presence and RFCOMM serial on Linux."""
+"""Bluetooth Classic discovery, pairing, scans and RFCOMM serial on Linux."""
 
 __version__ = "0.2.0"
 
 from .client import BluetoothClassic, normalize_address
-from .const import DEFAULT_PIN, DISCOVERY_SECONDS, PAIR_TIMEOUT, PRESENCE_SECONDS
+from .const import DEFAULT_PIN, DISCOVERY_SECONDS, PAIR_TIMEOUT, SCAN_FOR_SECONDS
 from .exceptions import (
     BluetoothClassicError,
     DeviceNotFoundError,
@@ -11,7 +11,7 @@ from .exceptions import (
     PairingError,
     RfcommUnsupportedError,
 )
-from .models import ClassicDevice, PresenceResult
+from .models import ClassicDevice, ScanResult
 from .rfcomm import (
     Security,
     open_rfcomm,
@@ -25,7 +25,7 @@ __all__ = [
     "DEFAULT_PIN",
     "DISCOVERY_SECONDS",
     "PAIR_TIMEOUT",
-    "PRESENCE_SECONDS",
+    "SCAN_FOR_SECONDS",
     "SERIAL_PORT",
     "BluetoothClassic",
     "BluetoothClassicError",
@@ -33,8 +33,8 @@ __all__ = [
     "DeviceNotFoundError",
     "NoAdapterError",
     "PairingError",
-    "PresenceResult",
     "RfcommUnsupportedError",
+    "ScanResult",
     "Security",
     "find_rfcomm_channel",
     "normalize_address",

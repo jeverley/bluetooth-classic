@@ -26,9 +26,9 @@ DEFAULT_PIN: Final = "0000"
 
 # How long a discovery runs by default.
 DISCOVERY_SECONDS: Final = 12.0
-# How long a presence check waits for a device to answer. A device that is on
+# How long scan_for() waits for a device to answer. A device that is on
 # and discoverable answers a Classic inquiry within a few seconds.
-PRESENCE_SECONDS: Final = 5.0
+SCAN_FOR_SECONDS: Final = 5.0
 # How long pairing may take before it is cancelled.
 PAIR_TIMEOUT: Final = 45.0
 # How long any other call to BlueZ may take. BlueZ answers within a second

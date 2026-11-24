@@ -35,11 +35,11 @@ class ClassicDevice:
 
 
 @dataclass(frozen=True, slots=True)
-class PresenceResult:
+class ScanResult:
     """Whether a device answered a short Classic scan, and how."""
 
     #: Whether it answered within the time allowed.
-    present: bool
+    found: bool
     #: Seconds until it answered.
     after: float | None = None
     #: Device properties BlueZ changed up to the answer, summarised for logs.

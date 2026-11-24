@@ -2,11 +2,11 @@
 name = "bluetooth-classic"
 version = "0.2.0"
 license = "Apache-2.0"
-description = "Bluetooth Classic (BR/EDR) discovery, pairing, presence and RFCOMM serial connections on Linux"
+description = "Bluetooth Classic (BR/EDR) discovery, pairing, scans and RFCOMM serial connections on Linux"
 authors = [{ name = "jeverley", email = "46714706+jeverley@users.noreply.github.com" }]
 readme = "README.md"
 requires-python = ">=3.11"
-keywords = ["bluetooth", "bluetooth classic", "br/edr", "bluez", "pairing", "presence", "rfcomm", "serial", "asyncio"]
+keywords = ["bluetooth", "bluetooth classic", "br/edr", "bluez", "pairing", "rfcomm", "serial", "asyncio"]
 dynamic = ["classifiers", "dependencies", "optional-dependencies"]
 
 [project.urls]

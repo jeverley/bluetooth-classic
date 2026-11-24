@@ -35,12 +35,14 @@ one. Requests about any other device are rejected.
 so BlueZ accepts its connections without asking. Some devices drop a
 connection from a host that does not trust them.
 
-## Checking presence
+## Scanning for one device
 
-{meth}`~bluetooth_classic.BluetoothClassic.check_presence` runs a short
-Classic scan and reports whether a known device answered, and how soon. It
-never connects, so it does not wake a device that wakes when connected to.
-A device answers only while it is on and discoverable.
+{meth}`~bluetooth_classic.BluetoothClassic.scan_for` runs a short Classic
+scan and reports whether a known device answered, and how soon; it stops as
+soon as the device answers. It never connects, so it does not wake a device
+that wakes when connected to. A device answers only while it is on and
+discoverable. Phones and computers usually are not, so this is no way to
+tell whether a person is home.
 
 Low Energy advertising and a link changing can also bring a signal strength
 from BlueZ; those are not taken as an answer.

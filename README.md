@@ -32,7 +32,7 @@
 
 <!-- docs-start -->
 
-Bluetooth Classic (BR/EDR) discovery, pairing, presence and RFCOMM serial
+Bluetooth Classic (BR/EDR) discovery, pairing, scans and RFCOMM serial
 connections on Linux.
 
 Python has good libraries for Bluetooth Low Energy, such as
@@ -46,9 +46,9 @@ asyncio event loop, without compiled extensions.
   strength.
 - **Pair** with a built-in agent for devices without a screen or keyboard,
   and **trust** them.
-- **Check presence**: whether a known device is on, with a short Classic scan
-  that never connects to it, so it does not wake a device that wakes when
-  connected to.
+- **Scan for a device**: whether a known device is on and discoverable, with
+  a short Classic scan that never connects to it, so it does not wake a
+  device that wakes when connected to.
 - **Connect** to a device's serial port (RFCOMM) through
   [serialx](https://github.com/puddly/serialx), with `rfcomm://` URLs, and
   find its channel.
@@ -82,8 +82,8 @@ async def main() -> None:
         device = await bluetooth.pair("00:11:22:33:44:55")
         await bluetooth.trust(device.address)
 
-        result = await bluetooth.check_presence(device.address)
-        print("on" if result.present else "off")
+        result = await bluetooth.scan_for(device.address)
+        print("on" if result.found else "off")
 
     # The device's serial port, as a serialx connection.
     reader, writer = await serialx.open_serial_connection(

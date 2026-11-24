@@ -1,11 +1,11 @@
 # CLAUDE.md
 
 `bluetooth-classic`: Bluetooth Classic (BR/EDR) discovery, pairing, trust
-and presence on Linux, through BlueZ over D-Bus with dbus-fast, and RFCOMM
+and scans for one device on Linux, through BlueZ over D-Bus with dbus-fast, and RFCOMM
 serial connections through a serialx `rfcomm://` handler. It holds what
 Classic devices need that Home Assistant's Bluetooth libraries do not, so
 each piece can later move to the library it belongs in (discovery and
-presence to habluetooth, pairing to bleak, `rfcomm://` to serialx). Generic:
+scans to habluetooth, pairing to bleak, `rfcomm://` to serialx). Generic:
 it knows nothing about any one kind of device or application. It is meant to
 fit alongside Home Assistant's Bluetooth libraries (the Bluetooth-Devices
 organisation), so it follows their layout and tooling: Poetry, `src/`

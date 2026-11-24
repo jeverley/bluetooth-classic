@@ -130,7 +130,7 @@ async def test_discover_returns_classic_devices_that_answered(bus: FakeBus) -> N
     assert bus.handlers == []
 
 
-async def test_check_presence_when_the_device_answers(bus: FakeBus) -> None:
+async def test_scan_for_when_the_device_answers(bus: FakeBus) -> None:
     bus.on_discovery = [
         # Low Energy advertising also brings a signal strength: not an answer.
         (
@@ -140,8 +140,8 @@ async def test_check_presence_when_the_device_answers(bus: FakeBus) -> None:
         (SPEAKER, {"RSSI": Variant("n", -60), "TxPower": Variant("n", 4)}),
     ]
     bluetooth = await connect(bus)
-    result = await bluetooth.check_presence(SPEAKER_ADDRESS, seconds=1)
-    assert result.present
+    result = await bluetooth.scan_for(SPEAKER_ADDRESS, seconds=1)
+    assert result.found
     assert result.after is not None
     assert result.changed["RSSI"] == -60
     assert result.changed["TxPower"] == 4
@@ -150,19 +150,19 @@ async def test_check_presence_when_the_device_answers(bus: FakeBus) -> None:
     assert bus.matches == []
 
 
-async def test_check_presence_when_the_device_is_off(bus: FakeBus) -> None:
+async def test_scan_for_when_the_device_is_off(bus: FakeBus) -> None:
     bus.objects[SPEAKER][DEVICE]["Connected"] = Variant("b", True)
     bluetooth = await connect(bus)
-    result = await bluetooth.check_presence(SPEAKER_ADDRESS, seconds=0.05)
-    assert not result.present
+    result = await bluetooth.scan_for(SPEAKER_ADDRESS, seconds=0.05)
+    assert not result.found
     assert result.linked
     assert bus.members().count("StopDiscovery") == 1
 
 
-async def test_check_presence_of_an_unknown_device(bus: FakeBus) -> None:
+async def test_scan_for_of_an_unknown_device(bus: FakeBus) -> None:
     bluetooth = await connect(bus)
     with pytest.raises(DeviceNotFoundError):
-        await bluetooth.check_presence("AA:BB:CC:DD:EE:FF")
+        await bluetooth.scan_for("AA:BB:CC:DD:EE:FF")
 
 
 async def test_pair_registers_an_agent_for_the_pairing_only(bus: FakeBus) -> None:
@@ -246,7 +246,7 @@ async def test_scans_report_a_powered_off_adapter(bus: FakeBus) -> None:
     with pytest.raises(NoAdapterError):
         await bluetooth.discover(seconds=0.05)
     with pytest.raises(NoAdapterError):
-        await bluetooth.check_presence(SPEAKER_ADDRESS, seconds=0.05)
+        await bluetooth.scan_for(SPEAKER_ADDRESS, seconds=0.05)
     # Nothing left behind: the filter is cleared and nothing listens.
     filters = [c[2][0] for c in bus.calls if c[0] == "SetDiscoveryFilter"]
     assert filters[-1] == {}
