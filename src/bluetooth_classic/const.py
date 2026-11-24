@@ -31,9 +31,15 @@ DISCOVERY_SECONDS: Final = 12.0
 PRESENCE_SECONDS: Final = 5.0
 # How long pairing may take before it is cancelled.
 PAIR_TIMEOUT: Final = 45.0
+# How long any other call to BlueZ may take. BlueZ answers within a second
+# normally; a call left waiting would hold up the caller.
+CALL_TIMEOUT: Final = 10.0
 
 # The discovery filter value that limits discovery to Bluetooth Classic.
 TRANSPORT_BREDR: Final = "bredr"
+
+# The error BlueZ returns when the adapter is powered off.
+ERROR_NOT_READY: Final = "org.bluez.Error.NotReady"
 
 # Device properties that come with a signal strength for reasons other than
 # answering a Classic inquiry: Low Energy advertising, or a link changing.

@@ -22,11 +22,13 @@ from .const import (
     AGENT_PATH,
     BLUEZ_PATH,
     BLUEZ_SERVICE,
+    CALL_TIMEOUT,
     DBUS_PATH,
     DBUS_SERVICE,
     DEFAULT_PIN,
     DEVICE_INTERFACE,
     DISCOVERY_SECONDS,
+    ERROR_NOT_READY,
     NOT_INQUIRY,
     OBJECT_MANAGER_INTERFACE,
     PAIR_TIMEOUT,
@@ -203,6 +205,9 @@ class BluetoothClassic:
 
         Devices that answer become known to BlueZ, so they can be paired.
         Only discoverable devices answer.
+
+        Raises:
+            NoAdapterError: The adapter is powered off.
         """
         answered: dict[str, int | None] = {}
 
@@ -220,7 +225,10 @@ class BluetoothClassic:
             await asyncio.sleep(seconds)
         found = []
         for device in await self.devices():
-            if device.path in answered:
+            # A Low Energy device can bring a signal strength alone, without
+            # the properties that mark advertising; only Classic devices
+            # have a device class.
+            if device.path in answered and device.device_class is not None:
                 rssi = answered[device.path]
                 if rssi is not None:
                     device = replace(device, rssi=int(rssi))
@@ -240,6 +248,7 @@ class BluetoothClassic:
         Raises:
             DeviceNotFoundError: BlueZ does not know the device; discover or
                 pair it first.
+            NoAdapterError: The adapter is powered off.
         """
         device = await self.device(address)
         if device is None:
@@ -286,6 +295,7 @@ class BluetoothClassic:
         Raises:
             DeviceNotFoundError: BlueZ does not know the device; discover it
                 first.
+            NoAdapterError: The adapter is powered off.
             PairingError: Pairing failed or timed out.
         """
         device = await self._known(address)
@@ -303,11 +313,15 @@ class BluetoothClassic:
             )
             try:
                 async with asyncio.timeout(timeout):
-                    await self._call(device.path, DEVICE_INTERFACE, "Pair")
+                    await self._call(
+                        device.path, DEVICE_INTERFACE, "Pair", timeout=None
+                    )
             except TimeoutError as err:
                 with contextlib.suppress(BluetoothClassicError):
                     await self._call(device.path, DEVICE_INTERFACE, "CancelPairing")
                 raise PairingError(f"Pairing with {device.address} timed out") from err
+            except NoAdapterError:
+                raise
             except BluetoothClassicError as err:
                 if "AlreadyExists" not in str(err):
                     raise PairingError(str(err)) from err
@@ -357,7 +371,8 @@ class BluetoothClassic:
         """Run Classic-only discovery on the adapter for the block's length.
 
         BlueZ keeps a discovery filter per client and merges them, so this
-        does not stop Low Energy scanning other programs have asked for.
+        does not stop Low Energy scanning other programs have asked for. The
+        filter is cleared afterwards.
         """
         await self._call(
             self._adapter_path,
@@ -366,14 +381,29 @@ class BluetoothClassic:
             "a{sv}",
             [{"Transport": Variant("s", TRANSPORT_BREDR)}],
         )
-        await self._call(self._adapter_path, ADAPTER_INTERFACE, "StartDiscovery")
         try:
-            yield
-        finally:
+            await self._call(self._adapter_path, ADAPTER_INTERFACE, "StartDiscovery")
             try:
-                await self._call(self._adapter_path, ADAPTER_INTERFACE, "StopDiscovery")
+                yield
+            finally:
+                try:
+                    await self._call(
+                        self._adapter_path, ADAPTER_INTERFACE, "StopDiscovery"
+                    )
+                except BluetoothClassicError as err:
+                    _LOGGER.debug("Could not stop discovery: %s", err)
+        finally:
+            # Clear this client's filter, so it does not shape later scans.
+            try:
+                await self._call(
+                    self._adapter_path,
+                    ADAPTER_INTERFACE,
+                    "SetDiscoveryFilter",
+                    "a{sv}",
+                    [{}],
+                )
             except BluetoothClassicError as err:
-                _LOGGER.debug("Could not stop discovery: %s", err)
+                _LOGGER.debug("Could not clear the discovery filter: %s", err)
 
     @contextlib.asynccontextmanager
     async def _listening(
@@ -443,9 +473,18 @@ class BluetoothClassic:
         member: str,
         signature: str = "",
         body: Iterable[Any] = (),
+        *,
+        timeout: float | None = CALL_TIMEOUT,
     ) -> list[Any]:
         return await _call(
-            self._bus, BLUEZ_SERVICE, path, interface, member, signature, body
+            self._bus,
+            BLUEZ_SERVICE,
+            path,
+            interface,
+            member,
+            signature,
+            body,
+            timeout=timeout,
         )
 
 
@@ -481,22 +520,37 @@ async def _call(
     member: str,
     signature: str = "",
     body: Iterable[Any] = (),
+    *,
+    timeout: float | None = CALL_TIMEOUT,
 ) -> list[Any]:
+    """Call a D-Bus method and return the reply's body.
+
+    Raises:
+        NoAdapterError: BlueZ says the adapter is not ready (powered off).
+        BluetoothClassicError: The call failed, or had no answer within
+            ``timeout`` seconds.
+    """
+    message = Message(
+        destination=destination,
+        path=path,
+        interface=interface,
+        member=member,
+        signature=signature,
+        body=list(body),
+    )
     try:
-        reply = await bus.call(
-            Message(
-                destination=destination,
-                path=path,
-                interface=interface,
-                member=member,
-                signature=signature,
-                body=list(body),
-            )
-        )
+        async with asyncio.timeout(timeout):
+            reply = await bus.call(message)
+    except TimeoutError as err:
+        raise BluetoothClassicError(
+            f"{member} had no answer within {timeout} s"
+        ) from err
     except Exception as err:
         raise BluetoothClassicError(f"{member} failed: {err}") from err
     if reply is None:
         raise BluetoothClassicError(f"{member} got no reply")
+    if reply.message_type == MessageType.ERROR and reply.error_name == ERROR_NOT_READY:
+        raise NoAdapterError(f"{member} failed: the adapter is powered off")
     if reply.message_type == MessageType.ERROR:
         raise BluetoothClassicError(f"{member} failed: {reply.error_name} {reply.body}")
     return list(reply.body)

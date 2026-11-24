@@ -55,9 +55,16 @@ class FakeBus:
         # Pairing: None succeeds; a string is a BlueZ error name; "hang" waits.
         self.pair_outcome: str | None = None
         self.agent_answers: list[Any] = []
+        # Calls that fail with a BlueZ error name, and calls never answered.
+        self.errors: dict[str, str] = {}
+        self.unanswered: set[str] = set()
 
     async def call(self, message: Any) -> SimpleNamespace:
         self.calls.append((message.member, message.path, list(message.body)))
+        if message.member in self.unanswered:
+            await asyncio.sleep(10)
+        if message.member in self.errors:
+            return self._error(self.errors[message.member])
         handler = getattr(self, f"_{message.member}", None)
         if handler is None:
             return self._reply()

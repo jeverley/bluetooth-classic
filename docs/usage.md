@@ -8,11 +8,16 @@ BlueZ on the system bus and chooses an adapter: the one you name, such as
 so the connection is closed afterwards. An application that already has a
 system bus connection can pass it as `bus`; it is then left open.
 
+Each call to BlueZ waits at most 10 seconds for an answer, except pairing,
+which has its own timeout. A scan or pairing on a powered-off adapter raises
+{class}`~bluetooth_classic.NoAdapterError`.
+
 ## Discovering devices
 
 {meth}`~bluetooth_classic.BluetoothClassic.discover` runs a Classic-only
 scan and returns the devices that answered, with their signal strength.
-Only discoverable devices answer. Devices found become known to BlueZ, so
+Only discoverable devices answer, and only devices with a Classic device
+class are returned. Devices found become known to BlueZ, so
 they can be paired, and {meth}`~bluetooth_classic.BluetoothClassic.devices`
 lists them afterwards along with the paired ones.
 
@@ -45,6 +50,7 @@ from BlueZ; those are not taken as an answer.
 A Classic scan uses the same radio as Low Energy scanning and interrupts it
 while it runs. BlueZ keeps a discovery filter for each client and merges
 them, so a scan from this library does not stop another program's Low
-Energy scanning, but it does pause it. Keep scans short, and in an
+Energy scanning, but it does pause it. The filter is cleared when the scan
+ends. Keep scans short, and in an
 application that also scans for Low Energy devices, let one part of it
 decide when they run.

@@ -15,6 +15,8 @@ from bluetooth_classic import (
     PairingError,
     normalize_address,
 )
+from bluetooth_classic.client import _call
+from bluetooth_classic.const import BLUEZ_SERVICE, OBJECT_MANAGER_INTERFACE
 
 from .conftest import (
     ADAPTER,
@@ -117,9 +119,10 @@ async def test_discover_returns_classic_devices_that_answered(bus: FakeBus) -> N
         (SPEAKER_ADDRESS, -60),
         ("AA:BB:CC:DD:EE:FF", -70),
     }
-    calls = bus.calls
-    filter_call = next(c for c in calls if c[0] == "SetDiscoveryFilter")
-    assert filter_call[2][0]["Transport"].value == "bredr"
+    filters = [c[2][0] for c in bus.calls if c[0] == "SetDiscoveryFilter"]
+    # Classic only while scanning, then cleared.
+    assert filters[0]["Transport"].value == "bredr"
+    assert filters[-1] == {}
     assert bus.members().count("StartDiscovery") == 1
     assert bus.members().count("StopDiscovery") == 1
     # Nothing left listening.
@@ -217,3 +220,64 @@ async def test_trust(bus: FakeBus) -> None:
     assert device.trusted
     await bluetooth.trust(SPEAKER_ADDRESS)
     assert bus.members().count("Set") == 1
+
+
+async def test_discover_leaves_out_devices_without_a_device_class(
+    bus: FakeBus,
+) -> None:
+    # A Low Energy device whose only change is a signal strength looks like
+    # an inquiry answer, but has no device class.
+    beacon = f"{HCI0}/dev_11_22_33_44_55_66"
+    bus.objects[beacon] = {
+        DEVICE: {"Address": Variant("s", "11:22:33:44:55:66")},
+    }
+    bus.on_discovery = [
+        (SPEAKER, {"RSSI": Variant("n", -60)}),
+        (beacon, {"RSSI": Variant("n", -50)}),
+    ]
+    bluetooth = await connect(bus)
+    found = await bluetooth.discover(seconds=0.05)
+    assert [d.address for d in found] == [SPEAKER_ADDRESS]
+
+
+async def test_scans_report_a_powered_off_adapter(bus: FakeBus) -> None:
+    bus.errors["StartDiscovery"] = "org.bluez.Error.NotReady"
+    bluetooth = await connect(bus)
+    with pytest.raises(NoAdapterError):
+        await bluetooth.discover(seconds=0.05)
+    with pytest.raises(NoAdapterError):
+        await bluetooth.check_presence(SPEAKER_ADDRESS, seconds=0.05)
+    # Nothing left behind: the filter is cleared and nothing listens.
+    filters = [c[2][0] for c in bus.calls if c[0] == "SetDiscoveryFilter"]
+    assert filters[-1] == {}
+    assert bus.matches == []
+    assert bus.handlers == []
+
+
+async def test_pair_reports_a_powered_off_adapter(bus: FakeBus) -> None:
+    bus.pair_outcome = "org.bluez.Error.NotReady"
+    bluetooth = await connect(bus)
+    with pytest.raises(NoAdapterError):
+        await bluetooth.pair(SPEAKER_ADDRESS)
+    assert bus.exported == {}
+
+
+async def test_an_unanswered_call_times_out(bus: FakeBus) -> None:
+    bus.unanswered.add("GetManagedObjects")
+    with pytest.raises(BluetoothClassicError, match="no answer"):
+        await _call(
+            bus,  # type: ignore[arg-type]
+            BLUEZ_SERVICE,
+            "/",
+            OBJECT_MANAGER_INTERFACE,
+            "GetManagedObjects",
+            timeout=0.05,
+        )
+
+
+async def test_pairing_is_not_cut_short_by_the_call_timeout(bus: FakeBus) -> None:
+    bluetooth = await connect(bus)
+    with patch("bluetooth_classic.client._call", wraps=_call) as call:
+        await bluetooth.pair(SPEAKER_ADDRESS)
+    pair = next(c for c in call.call_args_list if c.args[4] == "Pair")
+    assert pair.kwargs["timeout"] is None
