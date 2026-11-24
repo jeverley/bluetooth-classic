@@ -21,6 +21,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
 
+### Documentation
+
+- Say that bytes sent on connect go out from the D-Bus thread
+  ([`23741da`](https://github.com/jeverley/bluetooth-classic/commit/23741da2080ce85c59ef98d7fe98c095ba9b1c8f))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
 
 ## v0.6.0 (2026-11-24)
 
