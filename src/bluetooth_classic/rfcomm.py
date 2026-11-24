@@ -47,7 +47,7 @@ from serialx import (
 from serialx.platforms.serial_socket import SocketSerial, SocketSerialTransport
 
 from .client import normalize_address
-from .profile import connect_profile, release_profile
+from .profile import connect_profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -323,15 +323,15 @@ class RfcommSerialTransport(SocketSerialTransport):
         self._tcp_connection_lost_waiter = self._loop.create_future()
 
         target = serial._target
-        service = str(target.service)
-        bus, handover = await connect_profile(
+        profile_link = await connect_profile(
             target.address,
-            service,
+            str(target.service),
             adapter=target.adapter,
             timeout=connect_timeout,
             write_on_connect=serial._write_on_connect,
         )
-        self._release = lambda: release_profile(bus, handover.device_path, service)
+        handover = profile_link.handover
+        self._release = profile_link.release
         try:
             sock = socket.socket(fileno=handover.fd)
         except BaseException:

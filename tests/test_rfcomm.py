@@ -31,7 +31,7 @@ from bluetooth_classic.rfcomm import (
     rfcomm_url,
 )
 
-from .conftest import SPEAKER, SPEAKER_ADDRESS, SPP, FakeBus
+from .conftest import DEVICE, SPEAKER, SPEAKER_ADDRESS, SPP, FakeBus, device_properties
 
 URL = f"rfcomm://{SPEAKER_ADDRESS}?service=1101"
 REQUEST = b"hello"
@@ -170,8 +170,10 @@ async def test_open_rfcomm_connects_by_service(bluez: FakeBus) -> None:
 
 
 async def test_links_share_one_registration(bluez: FakeBus) -> None:
+    other = "/org/bluez/hci0/dev_66_77_88_99_AA_BB"
+    bluez.objects[other] = {DEVICE: device_properties("66:77:88:99:AA:BB", "Other")}
     first, first_protocol = await _open()
-    second, second_protocol = await _open()
+    second, second_protocol = await _open("rfcomm://66:77:88:99:AA:BB?service=1101")
     assert bluez.members().count("RegisterProfile") == 1
     first.close()
     await asyncio.wait_for(first_protocol.lost.wait(), 1)
@@ -182,6 +184,23 @@ async def test_links_share_one_registration(bluez: FakeBus) -> None:
     await asyncio.wait_for(second_protocol.lost.wait(), 1)
     await _settle()
     assert bluez.profiles == {}
+
+
+async def test_a_second_link_to_a_device_is_refused(bluez: FakeBus) -> None:
+    transport, protocol = await _open()
+    calls = len(bluez.calls)
+    with pytest.raises(RfcommConnectError, match="already has a link"):
+        await _open()
+    # The open link was left alone: BlueZ was not asked to disconnect it.
+    assert "DisconnectProfile" not in [m for m, _, _ in bluez.calls[calls:]]
+    assert not protocol.lost.is_set()
+    transport.close()
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+    await _settle()
+    # Once closed, the device can be connected again.
+    transport, protocol = await _open()
+    transport.close()
+    await asyncio.wait_for(protocol.lost.wait(), 1)
 
 
 async def test_open_links_are_listed(bluez: FakeBus) -> None:
@@ -238,14 +257,66 @@ async def test_no_connection_in_time(bluez: FakeBus) -> None:
     assert bluez.profiles == {}
 
 
-async def test_an_abandoned_connection_is_closed() -> None:
-    profile = profile_module._Profile()
+async def test_a_connection_nobody_waits_for_is_closed() -> None:
+    strays: list[str] = []
+    profile = profile_module._Profile(strays.append)
     ours, device = socket.socketpair()
     profile.NewConnection.__wrapped__(profile, SPEAKER, ours.detach(), {})
     device.settimeout(1)
-    # The handler's end was closed: the device reads end of file.
+    # The handler's end was closed, and BlueZ is to drop its side.
     assert device.recv(1) == b""
+    assert strays == [SPEAKER]
     device.close()
+
+
+async def test_a_handover_after_giving_up_is_dropped(bluez: FakeBus) -> None:
+    # Another device's link keeps the registration, so BlueZ can still hand
+    # over a socket after the connect was given up.
+    other = "/org/bluez/hci0/dev_66_77_88_99_AA_BB"
+    bluez.objects[other] = {DEVICE: device_properties("66:77:88:99:AA:BB", "Other")}
+    held, held_protocol = await _open("rfcomm://66:77:88:99:AA:BB?service=1101")
+    bluez.handover_delay = 0.1
+    with pytest.raises(TimeoutError):
+        await _open(connect_timeout=0.05, write_on_connect=REQUEST)
+    for _ in range(50):
+        if len(bluez.device_ends) == 2:
+            break
+        await asyncio.sleep(0.01)
+    await _settle()
+    device = bluez.device_ends[1]
+    device.settimeout(1)
+    # Nothing was sent to the device, our end is closed, and BlueZ was
+    # asked to drop the link after it arrived.
+    assert device.recv(64) == b""
+    assert bluez.calls[-1] == ("DisconnectProfile", SPEAKER, [SPP])
+    held.close()
+    await asyncio.wait_for(held_protocol.lost.wait(), 1)
+
+
+async def test_a_registration_from_an_older_bus_is_not_counted(
+    bluez: FakeBus,
+) -> None:
+    first, first_protocol = await _open()
+    # D-Bus restarts: the next link registers again on a new bus.
+    bluez.connected = False
+    newer = FakeBus()
+    newer.objects = bluez.objects
+
+    async def connect_bus() -> FakeBus:
+        return newer
+
+    with patch.object(profile_module._profiles, "_connect_bus", connect_bus):
+        second, second_protocol = await _open()
+        first.close()
+        await asyncio.wait_for(first_protocol.lost.wait(), 1)
+        await _settle()
+        # The first link's release did not touch the new registration.
+        assert len(newer.profiles) == 1
+        second.close()
+        await asyncio.wait_for(second_protocol.lost.wait(), 1)
+        await _settle()
+        assert newer.profiles == {}
+    newer.close()
 
 
 async def test_bytes_before_connection_made_are_held() -> None:

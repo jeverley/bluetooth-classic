@@ -66,6 +66,7 @@ class FakeBus:
         self.profiles: dict[str, str] = {}
         self.device_ends: list[socket.socket] = []
         self.handover = True
+        self.handover_delay = 0.0
         self.reply_on_connect = b""
 
     async def call(self, message: Any) -> SimpleNamespace:
@@ -182,6 +183,8 @@ class FakeBus:
 
     async def _ConnectProfile(self, message: Any) -> SimpleNamespace:
         uuid = message.body[0]
+        if self.handover_delay:
+            await asyncio.sleep(self.handover_delay)
         if self.handover:
             path = next(p for p, u in self.profiles.items() if u == uuid)
             ours, device = socket.socketpair()

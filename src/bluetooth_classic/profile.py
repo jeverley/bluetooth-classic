@@ -28,7 +28,8 @@ import itertools
 import logging
 import os
 import time
-from dataclasses import dataclass
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, field
 from typing import Any
 
 from dbus_fast import BusType, Variant
@@ -43,7 +44,7 @@ from .client import (
     _unwrap,
     normalize_address,
 )
-from .const import BLUEZ_PATH, BLUEZ_SERVICE, DEVICE_INTERFACE
+from .const import ADAPTER_INTERFACE, BLUEZ_PATH, BLUEZ_SERVICE, DEVICE_INTERFACE
 from .exceptions import (
     BluetoothClassicError,
     NoAdapterError,
@@ -68,13 +69,25 @@ class Handover:
     written_at: float
 
 
+# Background tasks (dropping BlueZ's side of links); kept so they finish.
+_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _spawn(coro: Coroutine[Any, Any, Any]) -> None:
+    task = asyncio.get_running_loop().create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
 class _Profile(ServiceInterface):
     """The object BlueZ calls with each connected socket for one service."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_stray: Callable[[str], None]) -> None:
         super().__init__("org.bluez.Profile1")
         # Per device path, in order: bytes to write at once, and the waiter.
         self._waiting: dict[str, list[tuple[bytes, asyncio.Future[Handover]]]] = {}
+        # Called with the device path of a connection nobody waits for.
+        self._on_stray = on_stray
 
     def expect(self, device_path: str, write: bytes) -> asyncio.Future[Handover]:
         """Wait for the next connection to a device."""
@@ -84,10 +97,19 @@ class _Profile(ServiceInterface):
 
     def forget(self, device_path: str, future: asyncio.Future[Handover]) -> None:
         """Stop waiting; a socket that arrives anyway is closed."""
-        waiting = self._waiting.get(device_path, [])
-        self._waiting[device_path] = [w for w in waiting if w[1] is not future]
-        if not self._waiting[device_path]:
-            del self._waiting[device_path]
+        waiting = [w for w in self._waiting.get(device_path, []) if w[1] is not future]
+        if waiting:
+            self._waiting[device_path] = waiting
+        else:
+            self._waiting.pop(device_path, None)
+
+    def _stray(self, device: str, fd: int) -> None:
+        # Nobody waits: the attempt was abandoned, or the device connected by
+        # itself. Close ours, and have BlueZ drop its side too, as it keeps
+        # its own reference to the link.
+        _LOGGER.debug("Unexpected connection from %s; closing it", device)
+        os.close(fd)
+        self._on_stray(device)
 
     @method()
     def Release(self) -> None:
@@ -99,14 +121,15 @@ class _Profile(ServiceInterface):
     ) -> None:
         waiting = self._waiting.get(device)
         if not waiting:
-            # Nobody waits: the attempt was abandoned, or the device
-            # connected by itself. Closing is the only safe end.
-            _LOGGER.debug("Unexpected connection from %s; closing it", device)
-            os.close(fd)
+            self._stray(device, fd)
             return
         write, future = waiting.pop(0)
         if not waiting:
             del self._waiting[device]
+        if future.done():
+            # Given up already: nothing is sent to the device.
+            self._stray(device, fd)
+            return
         try:
             if write:
                 # At once, before anything else runs on the event loop: some
@@ -114,14 +137,10 @@ class _Profile(ServiceInterface):
                 os.write(fd, write)
         except OSError as err:
             os.close(fd)
-            if not future.done():
-                future.set_exception(err)
+            self._on_stray(device)
+            future.set_exception(err)
             return
-        written_at = time.monotonic()
-        if future.done():
-            os.close(fd)
-            return
-        future.set_result(Handover(fd, device, written_at))
+        future.set_result(Handover(fd, device, time.monotonic()))
 
     @method()
     def RequestDisconnection(self, device: DBusObjectPath) -> None:
@@ -130,11 +149,16 @@ class _Profile(ServiceInterface):
         _LOGGER.debug("BlueZ asked to disconnect %s", device)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _Registration:
+    service: str
     path: str
     profile: _Profile
-    users: int
+    #: The bus it was made on: BlueZ drops it when that bus disconnects.
+    bus: MessageBus
+    users: int = 1
+    #: Devices with a link of this process to the service, open or opening.
+    devices: set[str] = field(default_factory=set)
 
 
 class _Profiles:
@@ -161,28 +185,30 @@ class _Profiles:
             bus_type=BusType.SYSTEM, negotiate_unix_fd=True
         ).connect()
 
-    async def bus(self) -> MessageBus:
-        """Return the shared bus, connecting it if needed."""
-        async with self._the_lock():
-            if self._bus is None or not self._bus.connected:
-                try:
-                    self._bus = await self._connect_bus()
-                except Exception as err:
-                    raise RfcommConnectError(
-                        f"Could not reach BlueZ over D-Bus: {err}"
-                    ) from err
-                self._registered = {}
-            return self._bus
+    async def _the_bus(self) -> MessageBus:
+        """Return the shared bus, connecting it if needed; call with the lock."""
+        if self._bus is None or not self._bus.connected:
+            try:
+                self._bus = await self._connect_bus()
+            except Exception as err:
+                raise RfcommConnectError(
+                    f"Could not reach BlueZ over D-Bus: {err}"
+                ) from err
+            # Registrations on the old bus went with it.
+            self._registered = {}
+        return self._bus
 
-    async def acquire(self, service: str) -> _Profile:
-        """Return the profile for a service, registering it if unused."""
-        bus = await self.bus()
+    async def acquire(self, service: str) -> _Registration:
+        """Return the registration for a service, registering it if unused."""
         async with self._the_lock():
+            bus = await self._the_bus()
             if (registration := self._registered.get(service)) is not None:
                 registration.users += 1
-                return registration.profile
+                return registration
             path = f"/org/bluetooth_classic/profile{next(_PROFILE_PATHS)}"
-            profile = _Profile()
+            profile = _Profile(
+                lambda device: _spawn(disconnect_profile(bus, device, service))
+            )
             bus.export(path, profile)
             try:
                 await _call(
@@ -211,21 +237,21 @@ class _Profiles:
                     f"BlueZ refused to register service {service}: {err}"
                 ) from err
             _LOGGER.debug("Registered service %s with BlueZ", service)
-            self._registered[service] = _Registration(path, profile, 1)
-            return profile
+            registration = _Registration(service, path, profile, bus)
+            self._registered[service] = registration
+            return registration
 
-    async def release(self, service: str) -> None:
-        """Stop using a service's profile; unregister it once unused."""
+    async def release(self, registration: _Registration) -> None:
+        """Stop using a registration; unregister it once unused."""
         async with self._the_lock():
-            registration = self._registered.get(service)
-            if registration is None:
-                return
             registration.users -= 1
             if registration.users > 0:
                 return
-            del self._registered[service]
-            bus = self._bus
-            if bus is None or not bus.connected:
+            if self._registered.get(registration.service) is registration:
+                del self._registered[registration.service]
+            bus = registration.bus
+            if not bus.connected:
+                # BlueZ dropped it with the bus.
                 return
             try:
                 await _call(
@@ -238,10 +264,12 @@ class _Profiles:
                     [registration.path],
                 )
             except BluetoothClassicError as err:
-                _LOGGER.debug("Could not unregister service %s: %s", service, err)
+                _LOGGER.debug(
+                    "Could not unregister service %s: %s", registration.service, err
+                )
             finally:
                 bus.unexport(registration.path, registration.profile)
-            _LOGGER.debug("Unregistered service %s from BlueZ", service)
+            _LOGGER.debug("Unregistered service %s from BlueZ", registration.service)
 
 
 _profiles = _Profiles()
@@ -256,8 +284,15 @@ async def _device_path(bus: MessageBus, address: str, adapter: str | None) -> st
         raise RfcommConnectError(str(err)) from err
     except BluetoothClassicError as err:
         raise RfcommConnectError(f"Could not ask BlueZ for devices: {err}") from err
-    matches = sorted(
+    powered = {
         path
+        for path, interfaces in objects.items()
+        if ADAPTER_INTERFACE in interfaces
+        and _unwrap(interfaces[ADAPTER_INTERFACE].get("Powered"))
+    }
+    # Under a powered adapter first, when none was asked for.
+    matches = sorted(
+        (path.rsplit("/", 1)[0] not in powered, path)
         for path, interfaces in objects.items()
         if DEVICE_INTERFACE in interfaces
         and normalize_address(str(_unwrap(interfaces[DEVICE_INTERFACE]["Address"])))
@@ -266,7 +301,7 @@ async def _device_path(bus: MessageBus, address: str, adapter: str | None) -> st
     )
     if not matches:
         raise RfcommConnectError(f"BlueZ does not know {address}; pair it first")
-    return matches[0]
+    return matches[0][1]
 
 
 async def disconnect_profile(bus: MessageBus, device_path: str, service: str) -> None:
@@ -286,6 +321,27 @@ async def disconnect_profile(bus: MessageBus, device_path: str, service: str) ->
         _LOGGER.debug("DisconnectProfile %s on %s: %s", service, device_path, err)
 
 
+@dataclass(slots=True, eq=False)
+class ProfileLink:
+    """A link BlueZ connected; release it once the socket has closed."""
+
+    handover: Handover
+    _registration: _Registration
+    _released: bool = False
+
+    async def release(self) -> None:
+        """Drop BlueZ's side of the closed link, and the registration once unused."""
+        if self._released:
+            return
+        self._released = True
+        registration = self._registration
+        await disconnect_profile(
+            registration.bus, self.handover.device_path, registration.service
+        )
+        registration.devices.discard(self.handover.device_path)
+        await _profiles.release(registration)
+
+
 async def connect_profile(
     address: str,
     service: str,
@@ -293,71 +349,90 @@ async def connect_profile(
     adapter: str | None,
     timeout: float | None,
     write_on_connect: bytes,
-) -> tuple[MessageBus, Handover]:
+) -> ProfileLink:
     """Have BlueZ connect a device's service and hand over the socket.
 
-    The caller owns the socket and must call ``release_profile()`` once the
-    link has closed.
+    The caller owns the socket and must call ``ProfileLink.release()`` once
+    the link has closed. ``timeout`` bounds the whole open.
 
     Raises:
         ProfileInUseError: Another program has registered the service.
-        RfcommConnectError: BlueZ could not connect.
+        RfcommConnectError: BlueZ could not connect, or this process already
+            has a link to the device's service, open or opening.
         TimeoutError: No connection within ``timeout`` seconds.
     """
-    profile = await _profiles.acquire(service)
+    async with asyncio.timeout(timeout):
+        registration = await _profiles.acquire(service)
+    device_path: str | None = None
     try:
-        bus = await _profiles.bus()
-        device_path = await _device_path(bus, address, adapter)
-        # A link BlueZ still holds would make the new one wait.
-        await disconnect_profile(bus, device_path, service)
-        future = profile.expect(device_path, write_on_connect)
-        try:
-            async with asyncio.timeout(timeout):
-                reply = asyncio.ensure_future(
-                    _call(
-                        bus,
-                        BLUEZ_SERVICE,
-                        device_path,
-                        DEVICE_INTERFACE,
-                        "ConnectProfile",
-                        "s",
-                        [service],
-                        timeout=None,
-                    )
+        async with asyncio.timeout(timeout):
+            bus = registration.bus
+            device_path = await _device_path(bus, address, adapter)
+            if device_path in registration.devices:
+                found, device_path = device_path, None
+                raise RfcommConnectError(
+                    f"{address} already has a link to service {service}"
+                    f" from this process ({found})"
                 )
-                waiting: set[asyncio.Future[Any]] = {reply, future}
-                done, _ = await asyncio.wait(
-                    waiting, return_when=asyncio.FIRST_COMPLETED
-                )
-                if future not in done:
-                    try:
-                        reply.result()
-                    except BluetoothClassicError as err:
-                        raise RfcommConnectError(
-                            f"BlueZ could not connect to {address}: {err}"
-                        ) from err
-                    handover = await future
-                else:
-                    handover = future.result()
-                    reply.add_done_callback(_ignore)
-        except BaseException:
-            profile.forget(device_path, future)
-            if future.done() and not future.cancelled() and not future.exception():
-                os.close(future.result().fd)
-            asyncio.get_running_loop().create_task(
-                disconnect_profile(bus, device_path, service)
+            registration.devices.add(device_path)
+            # No link of ours is open: one BlueZ still holds from before
+            # would make the new one wait.
+            await disconnect_profile(bus, device_path, service)
+            handover = await _connect(
+                registration, device_path, address, service, write_on_connect
             )
-            raise
     except BaseException:
-        await _profiles.release(service)
+        if device_path is not None:
+            registration.devices.discard(device_path)
+        await _profiles.release(registration)
         raise
-    return bus, handover
+    return ProfileLink(handover, registration)
 
 
-async def release_profile(bus: MessageBus, device_path: str, service: str) -> None:
-    """Drop BlueZ's side of a closed link, and the registration once unused."""
-    await disconnect_profile(bus, device_path, service)
-    await _profiles.release(service)
+async def _connect(
+    registration: _Registration,
+    device_path: str,
+    address: str,
+    service: str,
+    write_on_connect: bytes,
+) -> Handover:
+    """Ask BlueZ to connect, and wait for the socket it hands over."""
+    bus, profile = registration.bus, registration.profile
+    future = profile.expect(device_path, write_on_connect)
+    reply = asyncio.ensure_future(
+        _call(
+            bus,
+            BLUEZ_SERVICE,
+            device_path,
+            DEVICE_INTERFACE,
+            "ConnectProfile",
+            "s",
+            [service],
+            timeout=None,
+        )
+    )
+    # Whatever happens, the reply's outcome is collected.
+    reply.add_done_callback(_ignore)
+    try:
+        waiting: set[asyncio.Future[Any]] = {reply, future}
+        done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+        if future not in done:
+            try:
+                reply.result()
+            except BluetoothClassicError as err:
+                raise RfcommConnectError(
+                    f"BlueZ could not connect to {address}: {err}"
+                ) from err
+        return await future
+    except BaseException:
+        profile.forget(device_path, future)
+        if future.done() and not future.cancelled() and not future.exception():
+            os.close(future.result().fd)
+        future.cancel()
+        # A socket BlueZ hands over later is closed by the profile, which
+        # then has BlueZ drop it; meanwhile drop any it already made.
+        _spawn(disconnect_profile(bus, device_path, service))
+        raise
 
 
 def _ignore(task: asyncio.Future[Any]) -> None:

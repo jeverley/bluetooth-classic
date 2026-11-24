@@ -95,6 +95,9 @@ The baud rate is required by serialx and ignored. The URL takes:
 The device must be known to BlueZ (paired). serialx's blocking
 `serial_for_url()` refuses `rfcomm://` URLs.
 
+Link security is BlueZ's for client profiles: there is no option for it.
+Whether BlueZ asks for an encrypted link by default is unconfirmed.
+
 ### How it connects
 
 BlueZ makes the connection, through its profile API, as it makes bleak's
@@ -109,9 +112,12 @@ BlueZ accepts one registration per service UUID, so while one of the
 handler's links is open, another program cannot connect to that service
 through BlueZ, and the other way round:
 {class}`~bluetooth_classic.ProfileInUseError` says so. Links within one
-process share the registration.
+process share the registration. A process has at most one link to a
+device's service at a time: opening a second, while the first is open or
+opening, raises {class}`~bluetooth_classic.RfcommConnectError`.
 
-Two connection options are also accepted: `connect_timeout`, and
+Two connection options are also accepted: `connect_timeout`, which bounds
+the whole open, and
 `write_on_connect`, bytes written the moment BlueZ hands the connection
 over, before anything else runs. Use it for a device that changes state
 soon after a connection opens and only answers a request sent before then.
