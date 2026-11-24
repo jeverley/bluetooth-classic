@@ -218,6 +218,8 @@ class RfcommSerialTransport(SocketSerialTransport):
         super().__init__(loop, protocol)
         # Bytes received before the protocol is told the connection opened.
         self._early: list[bytes] = []
+        # Why the link dropped, if it did before the protocol was attached.
+        self._lost_before_attached: Exception | None = None
 
     async def _connect(  # type: ignore[override]
         self,
@@ -276,10 +278,14 @@ class RfcommSerialTransport(SocketSerialTransport):
         self._tcp_transport = transport
 
         if self._connection_lost_called:
+            # The device dropped the link before the protocol was attached:
+            # fail the connect, as a plain socket connect would have.
             transport.close()
             await self._tcp_connection_lost_waiter
             self._tcp_transport = None
-            return
+            raise self._lost_before_attached or ConnectionResetError(
+                "The device closed the connection as it opened"
+            )
 
         self._connection_made()
 
@@ -289,6 +295,12 @@ class RfcommSerialTransport(SocketSerialTransport):
         early, self._early = self._early, []
         for data in early:
             self._protocol.data_received(data)
+
+    def _connection_lost(self, exc: Exception | None) -> None:
+        """Note why the link dropped if the protocol was not attached yet."""
+        if not self._connection_made_called and exc is not None:
+            self._lost_before_attached = exc
+        super()._connection_lost(exc)
 
     def _data_received(self, data: bytes) -> None:
         """Pass on received bytes, holding any that come before connection_made."""

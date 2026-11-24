@@ -54,10 +54,13 @@ async def find_rfcomm_channel(
         async with asyncio.timeout(timeout):
             stdout, _ = await process.communicate()
     except TimeoutError:
-        process.kill()
-        await process.wait()
         _LOGGER.debug("sdptool timed out looking up %s on %s", service, address)
         return None
+    finally:
+        # Timed out or cancelled: stop sdptool rather than leave it running.
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
     if match := _CHANNEL_RE.search(stdout.decode(errors="replace")):
         return int(match.group(1))
     _LOGGER.debug("sdptool found no %s service on %s", service, address)

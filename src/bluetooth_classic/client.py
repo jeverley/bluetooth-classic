@@ -119,6 +119,8 @@ class BluetoothClassic:
         self._bus: MessageBus | None = None
         self._adapter_path = ""
         self._scan_lock = asyncio.Lock()
+        # One pairing at a time: the agent is exported at one path.
+        self._pair_lock = asyncio.Lock()
 
     async def __aenter__(self) -> Self:
         """Connect to BlueZ and choose the adapter.
@@ -127,6 +129,8 @@ class BluetoothClassic:
             BluetoothClassicError: The system bus could not be reached.
             NoAdapterError: There is no adapter, or not the one asked for.
         """
+        if self._bus is not None:
+            raise BluetoothClassicError("This BluetoothClassic is already open")
         bus = self._given_bus
         if bus is None:
             try:
@@ -207,7 +211,7 @@ class BluetoothClassic:
         """
         answered: dict[str, int | None] = {}
 
-        def on_answer(path: str, properties: dict[str, Any]) -> None:
+        def on_answer(path: str, properties: dict[str, Any], added: bool) -> None:
             # Low Energy devices found by other programs' scans also come
             # and go meanwhile; only Classic devices report a device class.
             if "Class" in properties or _is_inquiry_answer(properties):
@@ -255,10 +259,13 @@ class BluetoothClassic:
         answered = asyncio.Event()
         rssi: list[Any] = []
 
-        def on_answer(path: str, properties: dict[str, Any]) -> None:
+        def on_answer(path: str, properties: dict[str, Any], added: bool) -> None:
             if path != target or answered.is_set():
                 return
-            if "Class" in properties or _is_inquiry_answer(properties):
+            # A device BlueZ adds brings its class with the signal strength;
+            # for a known one, only a signal strength from an inquiry counts,
+            # not a class change made some other way.
+            if (added and "Class" in properties) or _is_inquiry_answer(properties):
                 rssi.append(_unwrap(properties.get("RSSI")))
                 answered.set()
 
@@ -295,6 +302,10 @@ class BluetoothClassic:
             NoAdapterError: The adapter is powered off.
             PairingError: Pairing failed or timed out.
         """
+        async with self._pair_lock:
+            return await self._pair(address, pin, timeout)
+
+    async def _pair(self, address: str, pin: str, timeout: float) -> ClassicDevice:
         device = await self._known(address)
         if device.paired:
             return device
@@ -421,20 +432,19 @@ class BluetoothClassic:
     @contextlib.asynccontextmanager
     async def _listening(
         self,
-        callback: Callable[[str, dict[str, Any]], None],
+        callback: Callable[[str, dict[str, Any], bool], None],
         *,
-        path: str | None = None,
         new_devices: bool = False,
     ) -> AsyncIterator[None]:
         """Call back with each device's changed properties during the block.
 
-        With ``path``, only that device's; otherwise every device on the
-        adapter. With ``new_devices``, devices BlueZ adds are reported too.
+        The callback gets the device's path, the properties, and whether
+        BlueZ has just added the device. With ``new_devices``, devices BlueZ
+        adds are reported too.
         """
-        where = f"path='{path}'" if path else f"path_namespace='{self._adapter_path}'"
         rules = [
             f"type='signal',interface='{PROPERTIES_INTERFACE}',"
-            f"member='PropertiesChanged',{where}"
+            f"member='PropertiesChanged',path_namespace='{self._adapter_path}'"
         ]
         if new_devices:
             rules.append(
@@ -450,16 +460,16 @@ class BluetoothClassic:
                 message.member == "PropertiesChanged"
                 and message.body[0] == DEVICE_INTERFACE
                 and message.path
-                and (message.path == path if path else message.path.startswith(prefix))
+                and message.path.startswith(prefix)
             ):
-                callback(message.path, message.body[1])
+                callback(message.path, message.body[1], False)
             elif (
                 new_devices
                 and message.member == "InterfacesAdded"
                 and str(message.body[0]).startswith(prefix)
                 and DEVICE_INTERFACE in message.body[1]
             ):
-                callback(message.body[0], message.body[1][DEVICE_INTERFACE])
+                callback(message.body[0], message.body[1][DEVICE_INTERFACE], True)
 
         added: list[str] = []
         self._require_open().add_message_handler(handler)

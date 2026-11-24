@@ -71,6 +71,9 @@ class FakeBus:
         return await handler(message)
 
     def export(self, path: str, interface: Any) -> None:
+        # dbus-fast refuses a second interface of the same name at a path.
+        if path in self.exported:
+            raise ValueError(f"An interface is already exported at {path}")
         self.exported[path] = interface
 
     def unexport(self, path: str, interface: Any) -> None:
@@ -130,6 +133,8 @@ class FakeBus:
         return self._reply()
 
     async def _Pair(self, message: Any) -> SimpleNamespace:
+        # Pairing takes a while, so other calls can run meanwhile.
+        await asyncio.sleep(0.01)
         if self.pair_outcome == "hang":
             await asyncio.sleep(10)
         if self.pair_outcome is not None:

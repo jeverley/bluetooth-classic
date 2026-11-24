@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -301,3 +302,35 @@ async def test_pairing_is_not_cut_short_by_the_call_timeout(bus: FakeBus) -> Non
         await bluetooth.pair(SPEAKER_ADDRESS)
     pair = next(c for c in call.call_args_list if c.args[4] == "Pair")
     assert pair.kwargs["timeout"] is None
+
+
+async def test_find_device_by_address_ignores_a_class_change(bus: FakeBus) -> None:
+    # A known device whose class changes without an inquiry answer.
+    bus.on_discovery = [(SPEAKER, {"Class": Variant("u", 0x240414)})]
+    bluetooth = await connect(bus)
+    assert await bluetooth.find_device_by_address(SPEAKER_ADDRESS, timeout=0.05) is None
+
+
+async def test_pairings_on_one_connection_run_one_at_a_time(bus: FakeBus) -> None:
+    other = f"{HCI0}/dev_AA_BB_CC_DD_EE_FF"
+    bus.objects[other] = {DEVICE: device_properties("AA:BB:CC:DD:EE:FF", "Other")}
+    bluetooth = await connect(bus)
+    first, second = await asyncio.gather(
+        bluetooth.pair(SPEAKER_ADDRESS), bluetooth.pair("AA:BB:CC:DD:EE:FF")
+    )
+    assert first.paired
+    assert second.paired
+    agent_calls = [m for m in bus.members() if m.endswith("Agent")]
+    assert agent_calls == [
+        "RegisterAgent",
+        "UnregisterAgent",
+        "RegisterAgent",
+        "UnregisterAgent",
+    ]
+    assert bus.exported == {}
+
+
+async def test_entering_twice_is_refused(bus: FakeBus) -> None:
+    bluetooth = await connect(bus)
+    with pytest.raises(BluetoothClassicError):
+        await bluetooth.__aenter__()

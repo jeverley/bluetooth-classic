@@ -29,17 +29,20 @@ class _Process:
         self.stdout = stdout
         self.hang = hang
         self.killed = False
+        self.returncode: int | None = None
 
     async def communicate(self) -> tuple[bytes, bytes]:
         if self.hang:
             await asyncio.sleep(10)
+        self.returncode = 0
         return self.stdout, b""
 
     def kill(self) -> None:
         self.killed = True
 
     async def wait(self) -> int:
-        return 0
+        self.returncode = -9
+        return -9
 
 
 def _spawn(process: _Process, calls: list[tuple[Any, ...]]) -> Any:
@@ -79,3 +82,14 @@ async def test_sdptool_times_out() -> None:
 async def test_bad_address() -> None:
     with pytest.raises(ValueError):
         await find_rfcomm_channel("not an address")
+
+
+async def test_cancelling_the_lookup_stops_sdptool() -> None:
+    process = _Process(hang=True)
+    with patch("asyncio.create_subprocess_exec", _spawn(process, [])):
+        task = asyncio.ensure_future(find_rfcomm_channel(ADDRESS))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert process.killed

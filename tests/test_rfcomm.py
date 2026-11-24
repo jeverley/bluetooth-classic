@@ -224,6 +224,27 @@ async def test_open_rfcomm_connects_as_the_client_expects(link: _Link) -> None:
     await asyncio.wait_for(protocol.lost.wait(), 1)
 
 
+async def test_a_link_dropped_as_it_opens_fails_the_connect(link: _Link) -> None:
+    loop = asyncio.get_running_loop()
+    original = loop.create_connection
+
+    async def dropping(factory: Any, **kwargs: Any) -> Any:
+        # The device resets the link before the protocol is attached.
+        transport, proxy = await original(factory, **kwargs)
+        proxy.connection_lost(ConnectionResetError(104, "reset by peer"))
+        return transport, proxy
+
+    protocol = _Recorder()
+    with (
+        patch.object(loop, "create_connection", dropping),
+        pytest.raises(ConnectionResetError),
+    ):
+        await serialx.create_serial_connection(
+            loop, lambda: protocol, URL, baudrate=9600
+        )
+    assert protocol.events == []
+
+
 async def test_bytes_before_connection_made_are_held() -> None:
     loop = asyncio.get_running_loop()
     protocol = _Recorder()
