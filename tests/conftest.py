@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -58,6 +59,14 @@ class FakeBus:
         # Calls that fail with a BlueZ error name, and calls never answered.
         self.errors: dict[str, str] = {}
         self.unanswered: set[str] = set()
+        self.connected = True
+        # The profile API: registered profiles (path -> UUID), and per
+        # connect, the device's end of the socket BlueZ hands over. With
+        # handover False, BlueZ answers ConnectProfile without a socket.
+        self.profiles: dict[str, str] = {}
+        self.device_ends: list[socket.socket] = []
+        self.handover = True
+        self.reply_on_connect = b""
 
     async def call(self, message: Any) -> SimpleNamespace:
         self.calls.append((message.member, message.path, list(message.body)))
@@ -159,6 +168,36 @@ class FakeBus:
         interface, name, value = message.body
         self.objects[message.path][interface][name] = value
         return self._reply()
+
+    async def _RegisterProfile(self, message: Any) -> SimpleNamespace:
+        path, uuid, _ = message.body
+        if uuid in self.profiles.values():
+            return self._error("org.bluez.Error.AlreadyExists")
+        self.profiles[path] = uuid
+        return self._reply()
+
+    async def _UnregisterProfile(self, message: Any) -> SimpleNamespace:
+        self.profiles.pop(message.body[0], None)
+        return self._reply()
+
+    async def _ConnectProfile(self, message: Any) -> SimpleNamespace:
+        uuid = message.body[0]
+        if self.handover:
+            path = next(p for p, u in self.profiles.items() if u == uuid)
+            ours, device = socket.socketpair()
+            self.device_ends.append(device)
+            if self.reply_on_connect:
+                device.sendall(self.reply_on_connect)
+            # BlueZ hands the connected socket to the profile, then answers.
+            profile: Any = self.exported[path]
+            type(profile).NewConnection.__wrapped__(
+                profile, message.path, ours.detach(), {}
+            )
+        return self._reply()
+
+    def close(self) -> None:
+        for end in self.device_ends:
+            end.close()
 
 
 @pytest.fixture

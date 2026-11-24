@@ -1,27 +1,29 @@
-"""Tests for the rfcomm:// serialx handler, with a socket pair for the link."""
+"""Tests for the rfcomm:// serialx handler, with a fake BlueZ profile API."""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import io
 import socket
 import sys
-import threading
-import time
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 import serialx
 
-from bluetooth_classic import SERIAL_PORT, ServiceLookupError
+from bluetooth_classic import (
+    SERIAL_PORT,
+    ProfileInUseError,
+    RfcommConnectError,
+    service_uuid,
+)
 from bluetooth_classic.rfcomm import (
     RfcommLink,
     RfcommSerialTransport,
     RfcommTarget,
-    Security,
-    _rfcomm_socket,
     on_rfcomm_links_changed,
     open_rfcomm,
     open_rfcomm_links,
@@ -29,13 +31,14 @@ from bluetooth_classic.rfcomm import (
     rfcomm_url,
 )
 
-ADDRESS = "00:11:22:33:44:55"
-URL = f"rfcomm://{ADDRESS}?channel=1"
-SERVICE_URL = f"rfcomm://{ADDRESS}?service=1101"
+from .conftest import SPEAKER, SPEAKER_ADDRESS, SPP, FakeBus
+
+URL = f"rfcomm://{SPEAKER_ADDRESS}?service=1101"
 REQUEST = b"hello"
 
 # serialx uses whichever copy of the module registered first; patch that one.
 rfcomm = sys.modules[serialx.common.get_uri_handler(URL).async_transport_cls.__module__]
+profile_module = sys.modules[rfcomm.__name__.rsplit(".", 1)[0] + ".profile"]
 
 
 class _Recorder(asyncio.Protocol):
@@ -54,99 +57,65 @@ class _Recorder(asyncio.Protocol):
         self.lost.set()
 
 
-class _Link:
-    """One end stands in for the RFCOMM socket; the other is the device."""
-
-    def __init__(self) -> None:
-        self.ours, self.device = socket.socketpair()
-        self.connected_to: tuple[str, int] | None = None
-        self.reply_on_connect = b""
-        # Channels nothing listens on, and the channel the service is on.
-        self.refused: set[int] = set()
-        self.offered: int | None = 1
-        self.lookups: list[tuple[str, Any, str | None]] = []
-        self.timeouts: list[float | None] = []
-
-    def connect(
-        self, target: RfcommTarget, channel: int, timeout: float | None
-    ) -> socket.socket:
-        self.timeouts.append(timeout)
-        if channel in self.refused:
-            raise ConnectionRefusedError(111, "Connection refused")
-        # The pair is connected already; record where it would have gone.
-        self.connected_to = (target.address, channel)
-        if self.reply_on_connect:
-            self.device.sendall(self.reply_on_connect)
-        return self.ours
-
-    def look_up(
-        self, address: str, service: Any, *, adapter: str | None, timeout: float
-    ) -> int | None:
-        self.lookups.append((address, service, adapter))
-        return self.offered
-
-    def close(self) -> None:
-        self.ours.close()
-        self.device.close()
-
-
 @pytest.fixture
-def link() -> Iterator[_Link]:
-    link = _Link()
+def bluez(bus: FakeBus) -> Iterator[FakeBus]:
+    """BlueZ on the fake bus, as the handler's bus."""
+
+    async def connect_bus() -> FakeBus:
+        return bus
+
+    profiles = profile_module._Profiles()
     with (
-        patch.object(rfcomm, "rfcomm_supported", return_value=True),
-        patch.object(rfcomm, "_connect", link.connect),
-        patch.object(rfcomm, "find_rfcomm_channel_blocking", link.look_up),
+        patch.object(profiles, "_connect_bus", connect_bus),
+        patch.object(profile_module, "_profiles", profiles),
     ):
-        yield link
-    link.close()
+        yield bus
+    bus.close()
+
+
+async def _open(url: str = URL, **kwargs: Any) -> tuple[Any, _Recorder]:
+    transport, protocol = await serialx.create_serial_connection(
+        asyncio.get_running_loop(), _Recorder, url, baudrate=9600, **kwargs
+    )
+    assert isinstance(protocol, _Recorder)
+    return transport, protocol
+
+
+async def _settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def test_service_uuids() -> None:
+    for form in ("1101", "0x1101", 0x1101, str(SERIAL_PORT), SERIAL_PORT):
+        assert service_uuid(form) == SERIAL_PORT
+    assert service_uuid("00001101") == SERIAL_PORT
+    with pytest.raises(ValueError):
+        service_uuid("serial")
 
 
 def test_urls() -> None:
-    assert rfcomm_url("00-11-22-33-44-55", channel=1) == URL
-    assert parse_rfcomm_url(URL) == RfcommTarget(ADDRESS, channel=1)
-    secure = f"rfcomm://{ADDRESS}?channel=30&security=medium"
-    assert rfcomm_url(ADDRESS, channel=30, security=Security.MEDIUM) == secure
-    assert parse_rfcomm_url(secure) == RfcommTarget(
-        ADDRESS, channel=30, security=Security.MEDIUM
-    )
-    assert parse_rfcomm_url(f"{URL}&security=HIGH").security == Security.HIGH
-
-
-def test_service_urls() -> None:
-    url = rfcomm_url(ADDRESS, service="1101", channel=10, adapter="hci1")
+    url = rfcomm_url("00-11-22-33-44-55", service="1101", adapter="hci1")
     assert url == (
-        f"rfcomm://{ADDRESS}?service=00001101-0000-1000-8000-00805f9b34fb"
-        "&channel=10&adapter=hci1"
+        f"rfcomm://{SPEAKER_ADDRESS}?service=00001101-0000-1000-8000-00805f9b34fb"
+        "&adapter=hci1"
     )
-    assert parse_rfcomm_url(url) == RfcommTarget(
-        ADDRESS, service=SERIAL_PORT, channel=10, adapter="hci1"
-    )
-    assert parse_rfcomm_url(f"rfcomm://{ADDRESS}?service=0x1101") == RfcommTarget(
-        ADDRESS, service=SERIAL_PORT
-    )
-    with pytest.raises(ValueError):
-        rfcomm_url(ADDRESS)
+    assert parse_rfcomm_url(url) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT, "hci1")
+    assert parse_rfcomm_url(URL) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT)
 
 
 @pytest.mark.parametrize(
     "url",
     [
-        "socket://00:11:22:33:44:55?channel=1",
+        "socket://00:11:22:33:44:55?service=1101",
         "rfcomm://00:11:22:33:44:55",
-        "rfcomm://00:11:22:33:44:55?security=low",
-        "rfcomm://00:11:22:33:44:55?channel=1&security=none",
-        "rfcomm://00:11:22:33:44:55?channel=1&security=low&security=high",
-        "rfcomm://00:11:22:33:44:55?channel=x",
-        "rfcomm://00:11:22:33:44:55?channel=0",
-        "rfcomm://00:11:22:33:44:55?channel=31",
-        "rfcomm://00:11:22:33:44:55?channel=1&channel=2",
+        "rfcomm://00:11:22:33:44:55?channel=1",
+        "rfcomm://00:11:22:33:44:55?service=1101&security=medium",
         "rfcomm://00:11:22:33:44:55?service=serial",
-        "rfcomm://00:11:22:33:44:55?channel=1&adapter=eth0",
-        "rfcomm://00:11:22:33:44:55?channel=1&colour=blue",
-        "rfcomm://00:11:22:33:44:55?service=1101&channel=",
-        "rfcomm://00:11:22:33:44:55?channel=1&security=",
-        "rfcomm://not-an-address?channel=1",
+        "rfcomm://00:11:22:33:44:55?service=",
+        "rfcomm://00:11:22:33:44:55?service=1101&service=1102",
+        "rfcomm://00:11:22:33:44:55?service=1101&adapter=eth0",
+        "rfcomm://not-an-address?service=1101",
     ],
 )
 def test_bad_urls(url: str) -> None:
@@ -154,119 +123,143 @@ def test_bad_urls(url: str) -> None:
         parse_rfcomm_url(url)
 
 
-class _NewSocket:
-    def __init__(self, *args: object, fail: bool = False) -> None:
-        self.options: list[tuple[Any, ...]] = []
-        self.closed = False
-        self.fail = fail
-
-    def setsockopt(self, *args: object) -> None:
-        if self.fail:
-            raise OSError("refused")
-        self.options.append(args)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-@pytest.fixture
-def new_socket() -> Iterator[_NewSocket]:
-    sock = _NewSocket()
-    with (
-        patch.object(rfcomm, "rfcomm_supported", return_value=True),
-        patch.object(socket, "socket", return_value=sock),
-        patch.object(socket, "AF_BLUETOOTH", 31, create=True),
-        patch.object(socket, "BTPROTO_RFCOMM", 3, create=True),
-    ):
-        yield sock
-
-
-def test_security_is_set_only_when_asked(new_socket: _NewSocket) -> None:
-    _rfcomm_socket(None)
-    assert new_socket.options == []
-    _rfcomm_socket(Security.MEDIUM)
-    assert new_socket.options == [(274, 4, b"\x02\x00")]
-
-
-def test_security_that_cannot_be_set_fails_the_connect(
-    new_socket: _NewSocket,
-) -> None:
-    new_socket.fail = True
-    with pytest.raises(OSError):
-        _rfcomm_socket(Security.HIGH)
-    assert new_socket.closed
-
-
-def test_connect_binds_to_the_adapter_asked_for() -> None:
-    calls: list[tuple[Any, ...]] = []
-
-    class _Socket:
-        def settimeout(self, timeout: float) -> None:
-            calls.append(("settimeout", timeout))
-
-        def bind(self, address: tuple[str, int]) -> None:
-            calls.append(("bind", address))
-
-        def connect(self, address: tuple[str, int]) -> None:
-            calls.append(("connect", address))
-
-    with (
-        patch.object(rfcomm, "_rfcomm_socket", return_value=_Socket()),
-        patch.object(rfcomm, "adapter_address", return_value="AA:BB:CC:DD:EE:FF"),
-    ):
-        rfcomm._connect(RfcommTarget(ADDRESS, channel=1, adapter="hci1"), 1, 5.0)
-    assert calls == [
-        ("settimeout", 5.0),
-        ("bind", ("AA:BB:CC:DD:EE:FF", 0)),
-        ("connect", (ADDRESS, 1)),
-    ]
-
-
-async def test_connection_through_serialx(link: _Link) -> None:
-    link.reply_on_connect = b"reply"
-    loop = asyncio.get_running_loop()
-    transport, protocol = await serialx.create_serial_connection(
-        loop, _Recorder, URL, baudrate=9600, write_on_connect=REQUEST
-    )
+async def test_bluez_connects_and_the_request_goes_first(bluez: FakeBus) -> None:
+    bluez.reply_on_connect = b"reply"
+    transport, protocol = await _open(write_on_connect=REQUEST)
     assert isinstance(transport, RfcommSerialTransport)
-    assert isinstance(protocol, _Recorder)
-    assert link.connected_to == (ADDRESS, 1)
-    # The device got the request before anything else.
-    link.device.settimeout(1)
-    assert link.device.recv(64) == REQUEST
+    # Registered as a client, then connected by service.
+    assert bluez.members()[-1] == "ConnectProfile"
+    assert ("ConnectProfile", SPEAKER, [SPP]) in bluez.calls
+    [(_, uuid)] = bluez.profiles.items()
+    assert uuid == SPP
+    device = bluez.device_ends[0]
+    device.settimeout(1)
+    # Written inside BlueZ's handover, before anything else.
+    assert device.recv(64) == REQUEST
     transport.write(b"next")
-    assert link.device.recv(64) == b"next"
-    # The reply sent as the link opened reaches the protocol after it is told
-    # the connection opened.
-    for _ in range(100):
-        if len(protocol.events) >= 2:
-            break
-        await asyncio.sleep(0.01)
+    assert device.recv(64) == b"next"
+    await _settle()
     assert protocol.events[:2] == [("made",), ("data", b"reply")]
-    # The device closing the link is reported.
-    link.device.close()
-    await asyncio.wait_for(protocol.lost.wait(), 1)
-    assert protocol.events[-1][0] == "lost"
-
-
-async def test_open_rfcomm_connects_as_the_client_expects(link: _Link) -> None:
-    transport, protocol = await open_rfcomm(
-        "00-11-22-33-44-55",
-        _Recorder,
-        channel=1,
-        write_on_connect=REQUEST,
-        security=Security.MEDIUM,
-    )
-    assert isinstance(transport, RfcommSerialTransport)
-    assert isinstance(protocol, _Recorder)
-    assert link.connected_to == (ADDRESS, 1)
-    link.device.settimeout(1)
-    assert link.device.recv(64) == REQUEST
+    assert transport.get_extra_info("rfcomm_service") == SERIAL_PORT
+    assert transport.get_extra_info("rfcomm_adapter") == "hci0"
     transport.close()
     await asyncio.wait_for(protocol.lost.wait(), 1)
+    await _settle()
+    # BlueZ drops its side, and the registration goes once unused.
+    assert bluez.members()[-2:] == ["DisconnectProfile", "UnregisterProfile"]
+    assert bluez.profiles == {}
 
 
-async def test_a_link_dropped_as_it_opens_fails_the_connect(link: _Link) -> None:
+async def test_the_device_closing_the_link_is_reported(bluez: FakeBus) -> None:
+    _, protocol = await _open()
+    bluez.device_ends[0].close()
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+    await _settle()
+    assert bluez.profiles == {}
+
+
+async def test_open_rfcomm_connects_by_service(bluez: FakeBus) -> None:
+    transport, protocol = await open_rfcomm(
+        "00-11-22-33-44-55", _Recorder, service=SERIAL_PORT, write_on_connect=REQUEST
+    )
+    bluez.device_ends[0].settimeout(1)
+    assert bluez.device_ends[0].recv(64) == REQUEST
+    transport.close()
+    assert isinstance(protocol, _Recorder)
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+
+
+async def test_links_share_one_registration(bluez: FakeBus) -> None:
+    first, first_protocol = await _open()
+    second, second_protocol = await _open()
+    assert bluez.members().count("RegisterProfile") == 1
+    first.close()
+    await asyncio.wait_for(first_protocol.lost.wait(), 1)
+    await _settle()
+    # Still in use by the second link.
+    assert len(bluez.profiles) == 1
+    second.close()
+    await asyncio.wait_for(second_protocol.lost.wait(), 1)
+    await _settle()
+    assert bluez.profiles == {}
+
+
+async def test_open_links_are_listed(bluez: FakeBus) -> None:
+    changes: list[list[RfcommLink]] = []
+    unsubscribe = on_rfcomm_links_changed(lambda: changes.append(open_rfcomm_links()))
+    try:
+        transport, protocol = await _open()
+        [listed] = open_rfcomm_links()
+        assert (listed.address, listed.service, listed.adapter) == (
+            SPEAKER_ADDRESS,
+            SERIAL_PORT,
+            "hci0",
+        )
+        transport.close()
+        await asyncio.wait_for(protocol.lost.wait(), 1)
+        assert open_rfcomm_links() == []
+        assert changes == [[listed], []]
+    finally:
+        unsubscribe()
+
+
+async def test_bluez_failing_to_connect(bluez: FakeBus) -> None:
+    bluez.handover = False
+    bluez.errors["ConnectProfile"] = "org.bluez.Error.Failed"
+    with pytest.raises(RfcommConnectError) as raised:
+        await _open()
+    # An OSError too, as the link could not be opened.
+    assert isinstance(raised.value, OSError)
+    await _settle()
+    assert bluez.profiles == {}
+
+
+async def test_another_program_holding_the_service(bluez: FakeBus) -> None:
+    bluez.profiles["/elsewhere"] = SPP
+    with pytest.raises(ProfileInUseError):
+        await _open()
+    assert "/org/bluetooth_classic/profile" not in "".join(bluez.exported)
+
+
+async def test_an_unknown_device(bluez: FakeBus) -> None:
+    with pytest.raises(RfcommConnectError, match="pair it first"):
+        await _open("rfcomm://66:77:88:99:AA:BB?service=1101")
+    with pytest.raises(RfcommConnectError):
+        await _open(f"{URL}&adapter=hci1")
+    await _settle()
+    assert bluez.profiles == {}
+
+
+async def test_no_connection_in_time(bluez: FakeBus) -> None:
+    bluez.unanswered.add("ConnectProfile")
+    with pytest.raises(TimeoutError):
+        await _open(connect_timeout=0.05)
+    await _settle()
+    assert bluez.profiles == {}
+
+
+async def test_an_abandoned_connection_is_closed() -> None:
+    profile = profile_module._Profile()
+    ours, device = socket.socketpair()
+    profile.NewConnection.__wrapped__(profile, SPEAKER, ours.detach(), {})
+    device.settimeout(1)
+    # The handler's end was closed: the device reads end of file.
+    assert device.recv(1) == b""
+    device.close()
+
+
+async def test_bytes_before_connection_made_are_held() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = _Recorder()
+    transport = RfcommSerialTransport(loop, protocol)
+    transport._data_received(b"early")
+    assert protocol.events == []
+    transport._connection_made()
+    transport._data_received(b"late")
+    assert protocol.events == [("made",), ("data", b"early"), ("data", b"late")]
+
+
+async def test_a_link_dropped_as_it_opens_fails_the_connect(bluez: FakeBus) -> None:
     loop = asyncio.get_running_loop()
     original = loop.create_connection
 
@@ -285,17 +278,14 @@ async def test_a_link_dropped_as_it_opens_fails_the_connect(link: _Link) -> None
             loop, lambda: protocol, URL, baudrate=9600
         )
     assert protocol.events == []
+    await _settle()
+    assert bluez.profiles == {}
 
 
-async def test_bytes_before_connection_made_are_held() -> None:
-    loop = asyncio.get_running_loop()
-    protocol = _Recorder()
-    transport = RfcommSerialTransport(loop, protocol)
-    transport._data_received(b"early")
-    assert protocol.events == []
-    transport._connection_made()
-    transport._data_received(b"late")
-    assert protocol.events == [("made",), ("data", b"early"), ("data", b"late")]
+def test_blocking_use_is_refused() -> None:
+    port = serialx.serial_for_url(URL, baudrate=9600)
+    with pytest.raises(io.UnsupportedOperation):
+        port.open()
 
 
 async def test_write_on_connect_is_only_for_rfcomm() -> None:
@@ -305,190 +295,5 @@ async def test_write_on_connect_is_only_for_rfcomm() -> None:
     assert routed == {}
 
 
-async def test_cancelling_a_connect_closes_the_socket_after_the_thread() -> None:
-    release = threading.Event()
-    closed = threading.Event()
-
-    class _Socket:
-        def close(self) -> None:
-            closed.set()
-
-    def blocking_open(*args: object) -> tuple[_Socket, RfcommLink]:
-        release.wait(5)
-        return _Socket(), RfcommLink(ADDRESS, 1, None, None)
-
-    loop = asyncio.get_running_loop()
-    with (
-        patch.object(rfcomm, "rfcomm_supported", return_value=True),
-        patch.object(rfcomm, "_open_link", blocking_open),
-    ):
-        task = asyncio.ensure_future(
-            serialx.create_serial_connection(loop, _Recorder, URL, baudrate=9600)
-        )
-        await asyncio.sleep(0.05)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        # The thread is still opening the link: nothing to close yet.
-        assert not closed.is_set()
-        release.set()
-        for _ in range(100):
-            if closed.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert closed.is_set()
-
-
-async def test_cancelling_as_the_open_finishes_closes_the_socket() -> None:
-    started = threading.Event()
-    go = threading.Event()
-    closed = threading.Event()
-
-    class _Socket:
-        def close(self) -> None:
-            closed.set()
-
-    def quick_open(*args: object) -> tuple[_Socket, RfcommLink]:
-        started.set()
-        go.wait(5)
-        return _Socket(), RfcommLink(ADDRESS, 1, None, None)
-
-    loop = asyncio.get_running_loop()
-    with (
-        patch.object(rfcomm, "rfcomm_supported", return_value=True),
-        patch.object(rfcomm, "_open_link", quick_open),
-    ):
-        task = asyncio.ensure_future(
-            serialx.create_serial_connection(loop, _Recorder, URL, baudrate=9600)
-        )
-        for _ in range(500):
-            if started.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert started.is_set()
-        # Let the thread finish and post its result without running the loop:
-        # the cancel lands before the task sees the socket.
-        go.set()
-        time.sleep(0.1)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        for _ in range(100):
-            if closed.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert closed.is_set()
-
-
-def test_the_whole_open_is_bounded_by_the_timeout(link: _Link) -> None:
-    def slow_look_up(*args: Any, **kwargs: Any) -> int:
-        time.sleep(0.1)
-        return 3
-
-    link.refused = {1}
-    target = parse_rfcomm_url(f"{SERVICE_URL}&channel=1")
-    with (
-        patch.object(rfcomm, "find_rfcomm_channel_blocking", slow_look_up),
-        pytest.raises(TimeoutError),
-    ):
-        rfcomm._open_link(target, 0.05, b"")
-
-
-async def _open(link: _Link, url: str) -> tuple[asyncio.Transport, _Recorder]:
-    transport, protocol = await serialx.create_serial_connection(
-        asyncio.get_running_loop(), _Recorder, url, baudrate=9600
-    )
-    assert isinstance(protocol, _Recorder)
-    return transport, protocol
-
-
-async def _close(transport: asyncio.Transport, protocol: _Recorder) -> None:
-    transport.close()
-    await asyncio.wait_for(protocol.lost.wait(), 1)
-
-
-async def test_a_channel_given_is_used_without_a_lookup(link: _Link) -> None:
-    transport, protocol = await _open(link, f"{SERVICE_URL}&channel=3")
-    assert link.lookups == []
-    assert link.connected_to == (ADDRESS, 3)
-    assert transport.get_extra_info("rfcomm_channel") == 3
-    assert transport.get_extra_info("rfcomm_service") == SERIAL_PORT
-    await _close(transport, protocol)
-
-
-async def test_a_service_alone_is_looked_up(link: _Link) -> None:
-    link.offered = 10
-    transport, protocol = await _open(link, f"{SERVICE_URL}&adapter=hci1")
-    assert link.lookups == [(ADDRESS, SERIAL_PORT, "hci1")]
-    assert link.connected_to == (ADDRESS, 10)
-    assert transport.get_extra_info("rfcomm_channel") == 10
-    assert transport.get_extra_info("rfcomm_adapter") == "hci1"
-    await _close(transport, protocol)
-
-
-async def test_a_refused_channel_is_looked_up_once(link: _Link) -> None:
-    link.refused = {3}
-    link.offered = 10
-    transport, protocol = await _open(link, f"{SERVICE_URL}&channel=3")
-    assert len(link.lookups) == 1
-    assert link.connected_to == (ADDRESS, 10)
-    assert transport.get_extra_info("rfcomm_channel") == 10
-    await _close(transport, protocol)
-
-
-async def test_a_refused_channel_without_a_service_fails(link: _Link) -> None:
-    link.refused = {1}
-    with pytest.raises(ConnectionRefusedError):
-        await _open(link, URL)
-    assert link.lookups == []
-
-
-async def test_a_refused_channel_the_lookup_confirms_fails(link: _Link) -> None:
-    link.refused = {3}
-    link.offered = 3
-    with pytest.raises(ConnectionRefusedError):
-        await _open(link, f"{SERVICE_URL}&channel=3")
-    assert len(link.lookups) == 1
-
-
-async def test_a_service_not_offered_fails(link: _Link) -> None:
-    link.offered = None
-    with pytest.raises(ServiceLookupError):
-        await _open(link, SERVICE_URL)
-    assert link.connected_to is None
-
-
-async def test_open_links_are_listed(link: _Link) -> None:
-    changes: list[list[RfcommLink]] = []
-    unsubscribe = on_rfcomm_links_changed(lambda: changes.append(open_rfcomm_links()))
-    try:
-        transport, protocol = await _open(link, URL)
-        [listed] = open_rfcomm_links()
-        assert (listed.address, listed.channel, listed.service) == (ADDRESS, 1, None)
-        await _close(transport, protocol)
-        assert open_rfcomm_links() == []
-        assert changes == [[listed], []]
-    finally:
-        unsubscribe()
-
-
-def test_blocking_serial_writes_as_it_opens(link: _Link) -> None:
-    # serialx types only its own options; handlers add theirs.
-    port = serialx.serial_for_url(
-        URL,
-        baudrate=9600,
-        write_on_connect=REQUEST,  # type: ignore[call-arg]
-    )
-    port.open()
-    assert [open.channel for open in open_rfcomm_links()] == [1]
-    try:
-        link.device.settimeout(1)
-        assert link.device.recv(64) == REQUEST
-        port.write(b"next")
-        assert link.device.recv(64) == b"next"
-        link.device.sendall(b"answer")
-        port.timeout = 1
-        assert port.read(6) == b"answer"
-    finally:
-        port.close()
-    assert open_rfcomm_links() == []
+def test_the_service_is_a_uuid() -> None:
+    assert isinstance(parse_rfcomm_url(URL).service, UUID)

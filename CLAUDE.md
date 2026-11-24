@@ -2,7 +2,7 @@
 
 `bluetooth-classic`: Bluetooth Classic (BR/EDR) discovery, pairing, trust
 and finding one device on Linux, through BlueZ over D-Bus with dbus-fast, and RFCOMM
-serial connections through a serialx `rfcomm://` handler. It holds what
+serial connections, made by BlueZ, through a serialx `rfcomm://` handler. It holds what
 Classic devices need that Home Assistant's Bluetooth libraries do not, so
 each piece can later move to the library it belongs in (discovery and
 scans to habluetooth, pairing to bleak, `rfcomm://` to serialx). Generic:
@@ -27,14 +27,18 @@ Read the Docs.
   `async with`).
 - Connections: only the generic `rfcomm://` serialx handler. No device
   protocols; callers bring their own.
-- The `rfcomm://` handler keeps no state between connections (no channel
-  cache): callers keep the channel a link reports and pass it back as a
-  hint. Links say which adapter they are on, and are listed while open, so
-  they can later be shown alongside Home Assistant's Bluetooth devices
-  and connections.
-- Service lookups are our own SDP client (`sdp.py`), not `sdptool`.
-- `agent.py` must not use `from __future__ import annotations`: dbus-fast
-  reads the D-Bus signatures from the method annotations.
+- The `rfcomm://` handler connects through BlueZ's profile API, as bleak's
+  connections go through BlueZ: register as a client of the service only
+  while in use, `ConnectProfile`, write `write_on_connect` inside
+  `Profile1.NewConnection`, and `DisconnectProfile` when the link closes
+  (BlueZ keeps its own reference; without it the next connect hangs).
+  No raw Bluetooth sockets, no SDP of our own, no channel-only URLs, and
+  only serialx's asyncio API. Links say which adapter they are on, and are
+  listed while open, so they can later be shown alongside Home Assistant's
+  Bluetooth devices and connections.
+- `agent.py` and `profile.py` must not use
+  `from __future__ import annotations`: dbus-fast reads the D-Bus
+  signatures from the method annotations.
 - Before committing: `ruff check .`, `ruff format --check .`, `mypy src
   tests`, `pytest`.
 - No em dashes, and no `--` in their place.

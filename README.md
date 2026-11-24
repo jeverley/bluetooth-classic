@@ -53,9 +53,9 @@ asyncio event loop, without compiled extensions.
 
 Method names follow [bleak](https://github.com/hbldh/bleak)'s where there is
 an equivalent.
-- **Connect** to a device's serial port (RFCOMM) through
-  [serialx](https://github.com/puddly/serialx), with `rfcomm://` URLs, and
-  find its channel.
+- **Connect** to a device's RFCOMM service, such as its serial port, through
+  [serialx](https://github.com/puddly/serialx) with `rfcomm://` URLs. BlueZ
+  makes the connection, through its profile API, as it does bleak's.
 
 It covers what a Classic device needs that the usual Python Bluetooth
 libraries do not, and nothing about any one kind of device.
@@ -89,8 +89,8 @@ async def main() -> None:
         found = await bluetooth.find_device_by_address(device.address)
         print("on" if found else "off")
 
-    # The device's Serial Port service (0x1101), as a serialx connection:
-    # its channel is looked up in the device's SDP records.
+    # The device's Serial Port service (0x1101), as a serialx connection,
+    # connected by BlueZ.
     reader, writer = await serialx.open_serial_connection(
         "rfcomm://00:11:22:33:44:55?service=1101", baudrate=9600
     )

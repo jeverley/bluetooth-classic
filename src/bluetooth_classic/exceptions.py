@@ -19,12 +19,12 @@ class PairingError(BluetoothClassicError):
     """The device could not be paired."""
 
 
-class RfcommUnsupportedError(BluetoothClassicError):
-    """This Python cannot open RFCOMM sockets (built without Bluetooth)."""
+class RfcommConnectError(BluetoothClassicError, OSError):
+    """BlueZ could not open the RFCOMM service on the device.
 
-
-class ServiceLookupError(BluetoothClassicError, OSError):
-    """A device's services could not be looked up (SDP), or it lacks the one asked for.
-
-    An ``OSError`` too, as the link it was needed for could not be opened.
+    An ``OSError`` too, as the link could not be opened.
     """
+
+
+class ProfileInUseError(RfcommConnectError):
+    """Another program has registered the same service with BlueZ."""

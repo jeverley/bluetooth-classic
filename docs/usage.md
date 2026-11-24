@@ -70,72 +70,57 @@ decide when they run.
 
 ## Serial connections (RFCOMM)
 
-RFCOMM carries a device's serial-style services, each on its own channel
-(1 to 30): the Serial Port Profile (`1101`), Dial-up Networking (`1103`),
-the OBEX services (object push, file transfer, phone book, messages) and
-vendors' own services with 128-bit UUIDs. Audio, input devices and
-networking (A2DP, AVRCP, HID, PAN) use L2CAP directly, not RFCOMM. Leave
-Headset and Hands-Free (`1108`, `111e`) to BlueZ and the audio system.
+RFCOMM carries a device's serial-style services: the Serial Port Profile
+(`1101`), Dial-up Networking (`1103`), the OBEX services and vendors' own
+services with 128-bit UUIDs. Audio, input devices and networking (A2DP,
+AVRCP, HID, PAN) use L2CAP directly, not RFCOMM. Leave Headset and
+Hands-Free (`1108`, `111e`) to BlueZ and the audio system.
 
 Importing `bluetooth_classic` registers an `rfcomm://` handler with
-[serialx](https://github.com/puddly/serialx), so its functions open a
+[serialx](https://github.com/puddly/serialx)'s asyncio API, so it opens a
 device's RFCOMM service like any serial port:
 
 ```python
 transport, protocol = await serialx.create_serial_connection(
     loop, MyProtocol, "rfcomm://00:11:22:33:44:55?service=1101", baudrate=9600
 )
-channel = transport.get_extra_info("rfcomm_channel")
 ```
 
-The baud rate is required by serialx and ignored. The URL takes a service,
-a channel, or both:
+The baud rate is required by serialx and ignored. The URL takes:
 
 - `service`: the service's UUID, or its 16- or 32-bit short form (`1101`).
-  Its channel is looked up in the device's SDP records.
-- `channel`: the RFCOMM channel, 1 to 30. With a service as well, the
-  channel is tried first; if the device refuses it, the service is looked
-  up once and the channel found is used.
 - `adapter` (optional): the local adapter, such as `hci0`. Without it,
-  Linux chooses. One that does not exist raises
-  {class}`~bluetooth_classic.NoAdapterError`.
-- `security` (optional): `low`, `medium` (an authenticated, encrypted link,
-  so the device must be paired) or `high`. Without it, Linux's default is
-  left alone. A level that cannot be set fails the connection.
+  BlueZ chooses.
 
-The handler keeps nothing between connections. A lookup is itself a short
-Bluetooth connection, and can wake a device that wakes when connected to,
-so keep the channel a connection used (`get_extra_info("rfcomm_channel")`)
-and pass it with the service next time: the lookup is then only made when
-the device has moved the service.
+The device must be known to BlueZ (paired). serialx's blocking
+`serial_for_url()` refuses `rfcomm://` URLs.
 
-An open connection also reports `rfcomm_service` and `rfcomm_adapter`
-through `get_extra_info()`. {func}`~bluetooth_classic.open_rfcomm_links`
-lists the links open through the handler, and
+### How it connects
+
+BlueZ makes the connection, through its profile API, as it makes bleak's
+connections: the handler registers as a client of the service, asks BlueZ
+to connect it on the device, and BlueZ finds the channel and hands over the
+connected socket over D-Bus. No Bluetooth sockets of Python's own are
+needed. When the link closes, the handler asks BlueZ to drop its side too
+(BlueZ keeps its own reference to the connection), and unregisters the
+service once no link uses it.
+
+BlueZ accepts one registration per service UUID, so while one of the
+handler's links is open, another program cannot connect to that service
+through BlueZ, and the other way round:
+{class}`~bluetooth_classic.ProfileInUseError` says so. Links within one
+process share the registration.
+
+Two connection options are also accepted: `connect_timeout`, and
+`write_on_connect`, bytes written the moment BlueZ hands the connection
+over, before anything else runs. Use it for a device that changes state
+soon after a connection opens and only answers a request sent before then.
+
+An open connection reports the channel BlueZ connected to, the service and
+the adapter through `get_extra_info()` (`rfcomm_channel`, `rfcomm_service`,
+`rfcomm_adapter`). {func}`~bluetooth_classic.open_rfcomm_links` lists the
+links open through the handler, and
 {func}`~bluetooth_classic.on_rfcomm_links_changed` calls back whenever one
-opens or closes. A blocking `serial_for_url()` port is listed until it is
-closed, even if the device has dropped the link.
-
-Two connection options are also accepted: `connect_timeout`, which covers a
-lookup too, and `write_on_connect`, bytes written by the thread that opens
-the link the moment it opens, before the event loop gets to it. Use it for
-a device that changes state soon after a connection opens and only answers
-a request sent before then.
+opens or closes.
 
 {func}`~bluetooth_classic.open_rfcomm` is a shortcut that builds the URL.
-{func}`~bluetooth_classic.rfcomm_supported` says whether this Python can
-open RFCOMM sockets at all; it needs Linux and a Python built with
-Bluetooth support.
-
-## Looking up services
-
-{func}`~bluetooth_classic.find_rfcomm_services` lists the services a device
-offers over RFCOMM, with their channels and names, and
-{func}`~bluetooth_classic.find_rfcomm_channel` returns one service's
-channel, or `None` if the device does not offer it. They ask the device's
-SDP server directly, over an L2CAP connection with Python's own Bluetooth
-sockets; BlueZ's D-Bus interface does not give a service's channel. Each
-has a blocking form (`find_rfcomm_services_blocking`,
-`find_rfcomm_channel_blocking`) for code already in a worker thread. A
-device that cannot be reached, or answers wrongly, raises
-{class}`~bluetooth_classic.ServiceLookupError`.
