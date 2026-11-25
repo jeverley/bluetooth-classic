@@ -1,6 +1,23 @@
 # CHANGELOG
 
 
+## v0.8.1 (2026-11-25)
+
+### Bug Fixes
+
+- Pick BlueZ's first adapter, the one aio-rfcomm links use
+  ([`6c587d4`](https://github.com/jeverley/bluetooth-classic/commit/6c587d40b84306481b0d5ddf968fcf90f896fb60))
+
+With no adapter named, BluetoothClassic now uses BlueZ's first adapter by object path, powered or
+  not, as aio-rfcomm does for RFCOMM links, instead of the first powered one. A device it pairs can
+  then always be connected; if that adapter is off, scans and pairing raise NoAdapterError instead
+  of moving to another adapter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.8.0 (2026-11-25)
 
 ### Code Style
