@@ -25,18 +25,17 @@ Read the Docs.
 - Method names and parameters follow bleak's where there is an equivalent
   (`discover(timeout=)`, `find_device_by_address()`, `pair()`, `unpair()`,
   `async with`).
-- Connections: only generic RFCOMM links: `RfcommClient` and
-  `establish_rfcomm_connection()`, shaped like bleak's `BleakClient` and
-  bleak-retry-connector's `establish_connection()`, on
-  `create_rfcomm_connection()`, shaped like asyncio's `create_connection()`.
-  No device protocols; callers bring their own.
+- Connections: only generic RFCOMM connections: `RfcommConnection` (open,
+  write, close; data and closing as callbacks; named for what the RFCOMM
+  specification calls it) and `establish_rfcomm_connection()`, shaped like
+  bleak-retry-connector's `establish_connection()`. A byte stream, with no
+  framing: no device protocols; callers bring their own.
 - Links come from aio-rfcomm (BlueZ's profile API on Linux). aio-rfcomm
   allows one Bluetooth object per process: this library owns it, on its
   own event loop in a background thread, and every caller in the process
-  shares it, so `write_on_connect` is sent the moment the channel opens
-  however busy the caller's loop is. No Bluetooth or D-Bus code of our own
-  for links, and no serialx. Open links are listed, so they can later be
-  shown alongside Home Assistant's Bluetooth devices and connections.
+  shares it, so `write_on_open` is sent the moment the link opens however
+  busy the caller's loop is. No Bluetooth or D-Bus code of our own for
+  links, and no serialx.
 - `agent.py` must not use
   `from __future__ import annotations`: dbus-fast reads the D-Bus
   signatures from the method annotations.

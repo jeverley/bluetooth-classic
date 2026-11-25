@@ -69,7 +69,7 @@ ends. Keep scans short, and in an
 application that also scans for Low Energy devices, let one part of it
 decide when they run.
 
-## RFCOMM links
+## RFCOMM connections
 
 RFCOMM carries a device's serial-style services: the Serial Port Profile
 (`1101`), Dial-up Networking (`1103`), the OBEX services and vendors' own
@@ -77,35 +77,41 @@ services with 128-bit UUIDs. Audio, input devices and networking (A2DP,
 AVRCP, HID, PAN) use L2CAP directly, not RFCOMM. Leave Headset and
 Hands-Free (`1108`, `111e`) to BlueZ and the audio system.
 
-{class}`~bluetooth_classic.RfcommClient` connects to a device's RFCOMM
-service, shaped like bleak's `BleakClient`: data the device sends arrives at
-`data_callback` from the first byte, and `disconnected_callback` is called
-with the client when the link ends (`disconnect_reason` says why).
+{class}`~bluetooth_classic.RfcommConnection` is a connection to a device's
+RFCOMM service (in the RFCOMM specification, a data link connection to the
+service's server channel). Open it, write to it and close it; data the
+device sends arrives at `data_callback` from the first byte, and
+`closed_callback` is called with the connection when it closes
+(`close_reason` says why, `None` when closed here).
 
 ```python
-client = RfcommClient(
+connection = RfcommConnection(
     "00:11:22:33:44:55",
     service=SERIAL_PORT,
     data_callback=on_data,
-    disconnected_callback=on_disconnected,
+    closed_callback=on_closed,
 )
-await establish_rfcomm_connection(client, write_on_connect=QUERY)
-client.write_nowait(b"...")  # queue and return
-await client.write(b"...")  # wait until it is on its way
-await client.disconnect()
+await establish_rfcomm_connection(connection, write_on_open=QUERY)
+connection.write_nowait(b"...")  # queue and return
+await connection.write(b"...")  # wait until it is on its way
+await connection.close()  # or connection.abort()
 ```
 
-{func}`~bluetooth_classic.establish_rfcomm_connection` connects it, as
-bleak-retry-connector's `establish_connection()` does: just after a link
-closes, BlueZ can refuse a new one for a moment, and it tries again (four
-times, a second apart) while the error says the device is busy. Such
-errors are raised as {class}`~bluetooth_classic.RfcommConnectError` with
-`errno` `EBUSY`; which error BlueZ gives is unconfirmed. `client.connect()`
-tries once.
+It is a stream: `data_callback` gets chunks as they arrive, with no message
+boundaries, so framing is the caller's job. `write()` waits until the bytes
+are on their way, not until the device has them.
 
-Underneath, {func}`~bluetooth_classic.create_rfcomm_connection` attaches an
-asyncio protocol instead, as `loop.create_connection()` does for a socket,
-and returns `(transport, protocol)`.
+{func}`~bluetooth_classic.establish_rfcomm_connection` opens it as
+bleak-retry-connector's `establish_connection()` connects a bleak client:
+just after a link closes, BlueZ can refuse a new one for a moment, and it
+tries again (four times, a second apart) while the error says the device is
+busy. Such errors are raised as {class}`~bluetooth_classic.RfcommConnectError`
+with `errno` `EBUSY`; which error BlueZ gives is unconfirmed.
+`connection.open()` tries once.
+
+Code written as an `asyncio.Protocol` can be attached with
+`data_callback=protocol.data_received` and a `closed_callback` that calls
+`protocol.connection_lost(connection.close_reason)`.
 
 `service` is the service's UUID, or its 16- or 32-bit short form (`1101`).
 The device must be known to BlueZ (paired).
@@ -130,27 +136,24 @@ another program cannot connect to that service through BlueZ.
 aio-rfcomm allows one Bluetooth object per process. This library opens it on
 first use and keeps it, on an event loop of its own in a background thread,
 and every caller in the process shares it: open links through
-this library rather than opening aio-rfcomm
-directly. If something else in the process has already opened aio-rfcomm,
+this library rather than opening aio-rfcomm directly. If something else in the process has already opened aio-rfcomm,
 connecting raises {class}`~bluetooth_classic.RfcommConnectError`. A process has at
 most one link to a device's service at a time: opening a second, while the
 first is open or opening, raises it too.
 
-Two options are also accepted: `timeout`, which bounds the whole open, and
-`write_on_connect`, bytes sent from the library's own loop the moment the channel opens, however busy the application's loop is.
+`open()` takes two options: `timeout`, which bounds the whole open, and
+`write_on_open`, bytes sent from the library's own loop the moment the link
+opens, however busy the application's loop is.
 Use it for a device that changes state soon after a connection opens and
 only answers a request sent before then.
 
-When the device or Bluetooth ends a link, the protocol's `connection_lost()`
-gets a `ConnectionResetError` (`ECONNRESET`): aio-rfcomm does not say why a
+When the device or Bluetooth ends a link, `close_reason` is a
+`ConnectionResetError` (`ECONNRESET`): aio-rfcomm does not say why a
 link ended, as RFCOMM reports even an orderly hang-up as a reset. Bluetooth
 itself going away gives a `ConnectionAbortedError` instead.
 
 Closing sends what is queued first, waiting at most two seconds for a
 device that has stopped reading; `abort()` drops it.
 
-An open link reports its address and service through `get_extra_info()`
-(`rfcomm_address`, `rfcomm_service`). {func}`~bluetooth_classic.open_rfcomm_links`
-lists the open links, and
-{func}`~bluetooth_classic.on_rfcomm_links_changed` calls back whenever one
-opens or closes.
+`opened_at` is when the link really opened, taken on the library's own
+thread, so it is not delayed by a busy application loop.

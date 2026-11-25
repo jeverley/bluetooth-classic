@@ -76,7 +76,7 @@ It needs Linux with BlueZ 5, and Python 3.11 or newer.
 ```python
 import asyncio
 
-from bluetooth_classic import SERIAL_PORT, BluetoothClassic, RfcommClient
+from bluetooth_classic import SERIAL_PORT, BluetoothClassic, RfcommConnection
 
 
 async def main() -> None:
@@ -90,12 +90,11 @@ async def main() -> None:
         found = await bluetooth.find_device_by_address(device.address)
         print("on" if found else "off")
 
-    # The device's Serial Port service, connected by BlueZ; used like
-    # bleak's BleakClient.
-    async with RfcommClient(
+    # The device's Serial Port service, connected by BlueZ.
+    async with RfcommConnection(
         "00:11:22:33:44:55", service=SERIAL_PORT, data_callback=print
-    ) as client:
-        await client.write(b"hello")
+    ) as connection:
+        await connection.write(b"hello")
 
 
 asyncio.run(main())

@@ -14,13 +14,8 @@ from .exceptions import (
 from .models import ClassicDevice
 from .rfcomm import (
     SERIAL_PORT,
-    RfcommClient,
-    RfcommLink,
-    RfcommTransport,
-    create_rfcomm_connection,
+    RfcommConnection,
     establish_rfcomm_connection,
-    on_rfcomm_links_changed,
-    open_rfcomm_links,
     service_uuid,
 )
 
@@ -36,14 +31,9 @@ __all__ = [
     "DeviceNotFoundError",
     "NoAdapterError",
     "PairingError",
-    "RfcommClient",
     "RfcommConnectError",
-    "RfcommLink",
-    "RfcommTransport",
-    "create_rfcomm_connection",
+    "RfcommConnection",
     "establish_rfcomm_connection",
     "normalize_address",
-    "on_rfcomm_links_changed",
-    "open_rfcomm_links",
     "service_uuid",
 ]
