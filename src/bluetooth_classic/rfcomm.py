@@ -1,8 +1,12 @@
 """RFCOMM links to Bluetooth Classic devices, through one aio-rfcomm owner.
 
-:func:`open_rfcomm` opens a device's RFCOMM service, such as its Serial Port
-(``SERIAL_PORT``), and attaches an asyncio protocol, as
-``loop.create_connection()`` does for a socket.
+:class:`RfcommClient` connects to a device's RFCOMM service, such as its
+Serial Port (``SERIAL_PORT``), shaped like bleak's ``BleakClient``: data and
+disconnections arrive as callbacks. :func:`establish_rfcomm_connection`
+connects one, retrying while BlueZ says the device is busy, as
+bleak-retry-connector's ``establish_connection()`` does.
+:func:`create_rfcomm_connection` is the lower-level form underneath: it
+attaches an asyncio protocol, as ``loop.create_connection()`` does.
 
 aio-rfcomm makes the connection: on Linux, BlueZ connects the service
 through its profile API, finds the channel itself and hands the connected
@@ -34,7 +38,7 @@ import time
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
 import aio_rfcomm
@@ -417,7 +421,7 @@ class RfcommTransport(asyncio.Transport):
         channel: _Channel,
         target: _Target,
     ) -> None:
-        """Not made directly: :func:`open_rfcomm` makes it."""
+        """Not made directly: :func:`create_rfcomm_connection` makes it."""
         super().__init__(
             {"rfcomm_address": target.address, "rfcomm_service": target.service}
         )
@@ -430,6 +434,8 @@ class RfcommTransport(asyncio.Transport):
         # Why the link ended, if the device or Bluetooth ended it.
         self._ended: Exception | None = None
         self._unsent = 0
+        self._sent = asyncio.Event()
+        self._sent.set()
 
     def _start(self) -> None:
         """Pass data on from now: the protocol has been told the link opened."""
@@ -459,6 +465,7 @@ class RfcommTransport(asyncio.Transport):
             return
         chunk = bytes(data)
         self._unsent += len(chunk)
+        self._sent.clear()
         _owner.loop().call_soon_threadsafe(self._channel.send, chunk)
 
     def can_write_eof(self) -> bool:
@@ -486,8 +493,14 @@ class RfcommTransport(asyncio.Transport):
         if not self._lost:
             self._protocol.data_received(data)
 
+    async def drain(self) -> None:
+        """Wait until everything written has been sent, or the link has ended."""
+        await self._sent.wait()
+
     def _on_sent(self, count: int) -> None:
         self._unsent = max(0, self._unsent - count)
+        if not self._unsent:
+            self._sent.set()
 
     def _end(self, exc: Exception) -> None:
         """The device or Bluetooth ended the link."""
@@ -529,6 +542,7 @@ class RfcommTransport(asyncio.Transport):
         self._lost = True
         _remove_link(id(self))
         self._unsent = 0
+        self._sent.set()
         try:
             self._protocol.connection_lost(self._ended)
         except Exception as err:
@@ -540,6 +554,20 @@ class RfcommTransport(asyncio.Transport):
                     "protocol": self._protocol,
                 }
             )
+
+
+# BlueZ's errors for a device or service still busy, as just after a link
+# closed. Which one BlueZ gives the soundbar is unconfirmed.
+_BUSY_ERRORS = frozenset({"org.bluez.Error.InProgress", "org.bluez.Error.Busy"})
+
+
+def _is_busy(err: BaseException) -> bool:
+    """Return whether aio-rfcomm's error says the device is busy for now."""
+    cause = err.__cause__
+    if getattr(cause, "type", None) in _BUSY_ERRORS:
+        return True
+    said = f"{err} {cause or ''}".lower()
+    return "busy" in said or "in progress" in said
 
 
 def _ignore_outcome(waiting: asyncio.Future[_Channel]) -> None:
@@ -561,7 +589,7 @@ def _abandon(
     closing.add_done_callback(lambda _: _release(key))
 
 
-async def open_rfcomm(
+async def create_rfcomm_connection(
     address: str,
     protocol_factory: Callable[[], asyncio.Protocol],
     *,
@@ -617,10 +645,14 @@ async def open_rfcomm(
             hint = (
                 " (aio-rfcomm uses BlueZ's first adapter: is the device paired on it?)"
             )
-        raise RfcommConnectError(
+        message = (
             f"{target.address}'s service {target.service} could not be "
             f"opened: {err}{hint}"
-        ) from err
+        )
+        if _is_busy(err):
+            # As a socket reports it, so callers can retry as they would.
+            raise RfcommConnectError(errno.EBUSY, message) from err
+        raise RfcommConnectError(message) from err
     except BaseException:
         _release(key)
         raise
@@ -637,3 +669,182 @@ async def open_rfcomm(
     protocol.connection_made(transport)
     transport._start()
     return transport, protocol
+
+
+# A client, shaped like bleak's.
+
+
+class RfcommClient:
+    """A connection to a device's RFCOMM service, shaped like bleak's BleakClient.
+
+    Data the device sends is passed to ``data_callback`` as it arrives, from
+    the first byte; ``disconnected_callback`` is called with the client when
+    the link ends, and ``disconnect_reason`` then says why (``None`` when it
+    was closed here).
+    """
+
+    def __init__(
+        self,
+        address: str,
+        *,
+        service: UUID | str | int,
+        data_callback: Callable[[bytes], None] | None = None,
+        disconnected_callback: Callable[[RfcommClient], None] | None = None,
+        timeout: float | None = DEFAULT_CONNECT_TIMEOUT,
+    ) -> None:
+        """Describe the connection; ``connect()`` opens it.
+
+        Raises:
+            ValueError: An address or service that is not valid.
+        """
+        self.address = normalize_address(address)
+        self.service = service_uuid(service)
+        self._data_callback = data_callback
+        self._disconnected_callback = disconnected_callback
+        self._timeout = timeout
+        self._transport: RfcommTransport | None = None
+        self._closed: asyncio.Event | None = None
+        #: When the link last opened, in ``time.monotonic()`` seconds.
+        self.connected_at: float | None = None
+        #: Why the link last ended: ``None`` when closed here.
+        self.disconnect_reason: Exception | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether the link is open."""
+        return self._transport is not None and not self._transport.is_closing()
+
+    async def connect(
+        self, *, timeout: float | None = None, write_on_connect: bytes = b""
+    ) -> None:
+        """Open the link, sending ``write_on_connect`` the moment it opens.
+
+        Raises:
+            RfcommConnectError: The service could not be opened; with
+                ``errno`` ``EBUSY`` when BlueZ says it is busy for now.
+            TimeoutError: No connection within the timeout.
+        """
+        if self.is_connected:
+            return
+        self._closed = asyncio.Event()
+        await create_rfcomm_connection(
+            self.address,
+            lambda: _ClientProtocol(self),
+            service=self.service,
+            timeout=self._timeout if timeout is None else timeout,
+            write_on_connect=write_on_connect,
+        )
+
+    def write_nowait(self, data: bytes) -> None:
+        """Queue bytes to send, in order, without waiting.
+
+        Raises:
+            RfcommConnectError: Not connected.
+        """
+        if self._transport is None or self._transport.is_closing():
+            raise RfcommConnectError(errno.ENOTCONN, f"Not connected to {self.address}")
+        self._transport.write(data)
+
+    async def write(self, data: bytes) -> None:
+        """Send bytes, waiting until they are on their way.
+
+        Raises:
+            RfcommConnectError: Not connected.
+        """
+        self.write_nowait(data)
+        assert self._transport is not None
+        await self._transport.drain()
+
+    async def disconnect(self) -> None:
+        """Close the link, once what is queued has been sent, and wait."""
+        transport, closed = self._transport, self._closed
+        if transport is None or closed is None:
+            return
+        transport.close()
+        await closed.wait()
+
+    async def __aenter__(self) -> RfcommClient:
+        """Connect."""
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Disconnect."""
+        await self.disconnect()
+
+
+class _ClientProtocol(asyncio.Protocol):
+    """Passes a link's events to its client."""
+
+    def __init__(self, client: RfcommClient) -> None:
+        self._client = client
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        assert isinstance(transport, RfcommTransport)
+        self._client._transport = transport
+        self._client.connected_at = time.monotonic()
+        self._client.disconnect_reason = None
+
+    def data_received(self, data: bytes) -> None:
+        if self._client._data_callback is not None:
+            self._client._data_callback(data)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        client = self._client
+        client._transport = None
+        client.disconnect_reason = exc
+        if client._closed is not None:
+            client._closed.set()
+        if client._disconnected_callback is not None:
+            client._disconnected_callback(client)
+
+
+class _Connectable(Protocol):
+    async def connect(
+        self, *, timeout: float | None = None, write_on_connect: bytes = b""
+    ) -> None: ...
+
+
+_ClientT = TypeVar("_ClientT", bound=_Connectable)
+
+#: How many times establish_rfcomm_connection() tries, and how long it waits
+#: between tries, while the device is busy.
+MAX_ATTEMPTS = 4
+RETRY_DELAY = 1.0
+
+
+async def establish_rfcomm_connection(
+    client: _ClientT,
+    *,
+    timeout: float | None = None,
+    write_on_connect: bytes = b"",
+    max_attempts: int = MAX_ATTEMPTS,
+    retry_delay: float = RETRY_DELAY,
+) -> _ClientT:
+    """Connect a client, retrying while BlueZ says the device is busy.
+
+    The equivalent of bleak-retry-connector's ``establish_connection()``:
+    just after a link closes, BlueZ can refuse a new one for a moment.
+    Any other failure is raised at once.
+
+    Raises:
+        RfcommConnectError: The service could not be opened.
+        TimeoutError: No connection within the timeout.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await client.connect(timeout=timeout, write_on_connect=write_on_connect)
+        except OSError as err:
+            if err.errno != errno.EBUSY or attempt == max_attempts:
+                raise
+            _LOGGER.debug(
+                "Busy (attempt %d of %d), trying again in %.1f s: %s",
+                attempt,
+                max_attempts,
+                retry_delay,
+                err,
+            )
+            await asyncio.sleep(retry_delay)
+        else:
+            return client
+    raise AssertionError("unreachable")

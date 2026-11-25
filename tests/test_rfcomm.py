@@ -31,9 +31,11 @@ from bluetooth_classic import (
     service_uuid,
 )
 from bluetooth_classic.rfcomm import (
+    RfcommClient,
     RfcommLink,
+    create_rfcomm_connection,
+    establish_rfcomm_connection,
     on_rfcomm_links_changed,
-    open_rfcomm,
     open_rfcomm_links,
 )
 
@@ -151,7 +153,7 @@ def bluetooth() -> Iterator[FakeBluetooth]:
 
 
 async def _open(address: str = SPEAKER_ADDRESS, **kwargs: Any) -> tuple[Any, _Recorder]:
-    transport, protocol = await open_rfcomm(
+    transport, protocol = await create_rfcomm_connection(
         address, _Recorder, service=SERIAL_PORT, **kwargs
     )
     assert isinstance(protocol, _Recorder)
@@ -246,8 +248,10 @@ async def test_after_a_drop_the_device_is_freed_once_the_link_has_closed(
     await _close(*await _open())
 
 
-async def test_open_rfcomm_connects_by_service(bluetooth: FakeBluetooth) -> None:
-    transport, protocol = await open_rfcomm(
+async def test_create_rfcomm_connection_connects_by_service(
+    bluetooth: FakeBluetooth,
+) -> None:
+    transport, protocol = await create_rfcomm_connection(
         "00-11-22-33-44-55", _Recorder, service=SERIAL_PORT, write_on_connect=REQUEST
     )
     assert bluetooth.channels[0].sent == [REQUEST]
@@ -430,7 +434,7 @@ async def test_abort_drops_what_is_queued(bluetooth: FakeBluetooth) -> None:
 
 async def test_a_bad_service_is_refused() -> None:
     with pytest.raises(ValueError):
-        await open_rfcomm(SPEAKER_ADDRESS, _Recorder, service="serial")
+        await create_rfcomm_connection(SPEAKER_ADDRESS, _Recorder, service="serial")
 
 
 async def test_sent_bytes_leave_the_write_buffer(bluetooth: FakeBluetooth) -> None:
@@ -456,3 +460,127 @@ async def test_a_close_drops_what_a_stalled_device_does_not_take(
         await asyncio.wait_for(protocol.lost.wait(), 1)
     assert channel.sent == []
     assert channel.closed.is_set()
+
+
+def _connected(client: RfcommClient) -> bool:
+    # Read through a function, so a type checker does not narrow it.
+    return client.is_connected
+
+
+async def test_the_client_connects_and_passes_data_on(bluetooth: FakeBluetooth) -> None:
+    received: list[bytes] = []
+    dropped: list[RfcommClient] = []
+    client = RfcommClient(
+        "00-11-22-33-44-55",
+        service=SERIAL_PORT,
+        data_callback=received.append,
+        disconnected_callback=dropped.append,
+    )
+    assert not _connected(client)
+    await client.connect(write_on_connect=REQUEST)
+    assert _connected(client)
+    assert client.connected_at is not None
+    [channel] = bluetooth.channels
+    assert channel.sent == [REQUEST]
+    await client.write(b"one")
+    assert channel.sent == [REQUEST, b"one"]
+    client.write_nowait(b"two")
+    await _until(lambda: channel.sent[-1] == b"two")
+    bluetooth.from_device(channel, b"reply")
+    await _until(lambda: received == [b"reply"])
+    await client.disconnect()
+    assert not _connected(client)
+    assert dropped == [client]
+    assert client.disconnect_reason is None
+
+
+async def test_the_client_reports_a_drop(bluetooth: FakeBluetooth) -> None:
+    dropped: list[RfcommClient] = []
+    client = RfcommClient(
+        SPEAKER_ADDRESS, service=SERIAL_PORT, disconnected_callback=dropped.append
+    )
+    await client.connect()
+    bluetooth.from_device(bluetooth.channels[0], None)
+    await _until(lambda: dropped == [client])
+    assert isinstance(client.disconnect_reason, ConnectionResetError)
+    with pytest.raises(RfcommConnectError) as raised:
+        client.write_nowait(b"late")
+    assert raised.value.errno == errno.ENOTCONN
+
+
+async def test_the_client_as_a_context_manager(bluetooth: FakeBluetooth) -> None:
+    async with RfcommClient(SPEAKER_ADDRESS, service=SERIAL_PORT) as client:
+        assert _connected(client)
+    assert not _connected(client)
+    await _until(bluetooth.channels[0].closed.is_set)
+
+
+class _BlueZError(Exception):
+    def __init__(self, error_type: str, text: str) -> None:
+        super().__init__(text)
+        self.type = error_type
+
+
+def _refusal(error_type: str, text: str) -> ConnectionFailedError:
+    failure = ConnectionFailedError("refused")
+    failure.__cause__ = _BlueZError(error_type, text)
+    return failure
+
+
+async def test_a_busy_device_is_marked_ebusy(bluetooth: FakeBluetooth) -> None:
+    bluetooth.fail = _refusal("org.bluez.Error.InProgress", "Operation in progress")
+    with pytest.raises(RfcommConnectError) as raised:
+        await _open()
+    assert raised.value.errno == errno.EBUSY
+    bluetooth.fail = _refusal("org.bluez.Error.Failed", "br-connection-busy")
+    with pytest.raises(RfcommConnectError) as raised:
+        await _open()
+    assert raised.value.errno == errno.EBUSY
+    bluetooth.fail = _refusal("org.bluez.Error.Failed", "Host is down")
+    with pytest.raises(RfcommConnectError) as raised:
+        await _open()
+    assert raised.value.errno is None
+
+
+class _Flaky:
+    """A client that is busy a few times, then connects."""
+
+    def __init__(self, busy: int, error: OSError | None = None) -> None:
+        self.busy = busy
+        self.error = error or OSError(errno.EBUSY, "busy")
+        self.attempts = 0
+
+    async def connect(
+        self, *, timeout: float | None = None, write_on_connect: bytes = b""
+    ) -> None:
+        self.attempts += 1
+        if self.attempts <= self.busy:
+            raise self.error
+
+
+async def test_establish_retries_while_busy() -> None:
+    client = _Flaky(busy=2)
+    assert await establish_rfcomm_connection(client, retry_delay=0) is client
+    assert client.attempts == 3
+
+
+async def test_establish_gives_up_after_its_attempts() -> None:
+    client = _Flaky(busy=10)
+    with pytest.raises(OSError) as raised:
+        await establish_rfcomm_connection(client, max_attempts=3, retry_delay=0)
+    assert raised.value.errno == errno.EBUSY
+    assert client.attempts == 3
+
+
+async def test_establish_does_not_retry_other_failures() -> None:
+    client = _Flaky(busy=1, error=OSError(errno.EHOSTDOWN, "Host is down"))
+    with pytest.raises(OSError):
+        await establish_rfcomm_connection(client, retry_delay=0)
+    assert client.attempts == 1
+
+
+async def test_establish_connects_a_real_client(bluetooth: FakeBluetooth) -> None:
+    client = RfcommClient(SPEAKER_ADDRESS, service=SERIAL_PORT)
+    await establish_rfcomm_connection(client, write_on_connect=REQUEST)
+    assert bluetooth.channels[0].sent == [REQUEST]
+    await client.disconnect()

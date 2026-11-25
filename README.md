@@ -53,8 +53,8 @@ asyncio event loop, without compiled extensions.
 
 Method names follow [bleak](https://github.com/hbldh/bleak)'s where there is
 an equivalent.
-- **Connect** to a device's RFCOMM service, such as its serial port, as an
-  asyncio transport and protocol.
+- **Connect** to a device's RFCOMM service, such as its serial port, with a
+  client shaped like bleak's `BleakClient`.
   [aio-rfcomm](https://github.com/dlech/aio-rfcomm) makes the connection
   (through BlueZ's profile API); this library is the one aio-rfcomm owner
   in the process, shared by every caller, and bytes to send on connect go
@@ -76,7 +76,7 @@ It needs Linux with BlueZ 5, and Python 3.11 or newer.
 ```python
 import asyncio
 
-from bluetooth_classic import SERIAL_PORT, BluetoothClassic, open_rfcomm
+from bluetooth_classic import SERIAL_PORT, BluetoothClassic, RfcommClient
 
 
 async def main() -> None:
@@ -90,12 +90,12 @@ async def main() -> None:
         found = await bluetooth.find_device_by_address(device.address)
         print("on" if found else "off")
 
-    # The device's Serial Port service, connected by BlueZ, with a protocol
-    # attached as asyncio's create_connection() does.
-    transport, protocol = await open_rfcomm(
-        "00:11:22:33:44:55", asyncio.Protocol, service=SERIAL_PORT
-    )
-    transport.close()
+    # The device's Serial Port service, connected by BlueZ; used like
+    # bleak's BleakClient.
+    async with RfcommClient(
+        "00:11:22:33:44:55", service=SERIAL_PORT, data_callback=print
+    ) as client:
+        await client.write(b"hello")
 
 
 asyncio.run(main())

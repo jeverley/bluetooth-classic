@@ -25,9 +25,11 @@ Read the Docs.
 - Method names and parameters follow bleak's where there is an equivalent
   (`discover(timeout=)`, `find_device_by_address()`, `pair()`, `unpair()`,
   `async with`).
-- Connections: only generic RFCOMM links (`open_rfcomm()`, shaped like
-  asyncio's `create_connection()`). No device protocols; callers bring
-  their own.
+- Connections: only generic RFCOMM links: `RfcommClient` and
+  `establish_rfcomm_connection()`, shaped like bleak's `BleakClient` and
+  bleak-retry-connector's `establish_connection()`, on
+  `create_rfcomm_connection()`, shaped like asyncio's `create_connection()`.
+  No device protocols; callers bring their own.
 - Links come from aio-rfcomm (BlueZ's profile API on Linux). aio-rfcomm
   allows one Bluetooth object per process: this library owns it, on its
   own event loop in a background thread, and every caller in the process

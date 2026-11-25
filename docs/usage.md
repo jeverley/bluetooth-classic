@@ -76,15 +76,35 @@ services with 128-bit UUIDs. Audio, input devices and networking (A2DP,
 AVRCP, HID, PAN) use L2CAP directly, not RFCOMM. Leave Headset and
 Hands-Free (`1108`, `111e`) to BlueZ and the audio system.
 
-{func}`~bluetooth_classic.open_rfcomm` opens a device's RFCOMM service and
-attaches a protocol, as asyncio's `loop.create_connection()` does for a
-socket:
+{class}`~bluetooth_classic.RfcommClient` connects to a device's RFCOMM
+service, shaped like bleak's `BleakClient`: data the device sends arrives at
+`data_callback` from the first byte, and `disconnected_callback` is called
+with the client when the link ends (`disconnect_reason` says why).
 
 ```python
-transport, protocol = await open_rfcomm(
-    "00:11:22:33:44:55", MyProtocol, service=SERIAL_PORT
+client = RfcommClient(
+    "00:11:22:33:44:55",
+    service=SERIAL_PORT,
+    data_callback=on_data,
+    disconnected_callback=on_disconnected,
 )
+await establish_rfcomm_connection(client, write_on_connect=QUERY)
+client.write_nowait(b"...")   # queue and return
+await client.write(b"...")    # wait until it is on its way
+await client.disconnect()
 ```
+
+{func}`~bluetooth_classic.establish_rfcomm_connection` connects it, as
+bleak-retry-connector's `establish_connection()` does: just after a link
+closes, BlueZ can refuse a new one for a moment, and it tries again (four
+times, a second apart) while the error says the device is busy. Such
+errors are raised as {class}`~bluetooth_classic.RfcommConnectError` with
+`errno` `EBUSY`; which error BlueZ gives is unconfirmed. `client.connect()`
+tries once.
+
+Underneath, {func}`~bluetooth_classic.create_rfcomm_connection` attaches an
+asyncio protocol instead, as `loop.create_connection()` does for a socket,
+and returns `(transport, protocol)`.
 
 `service` is the service's UUID, or its 16- or 32-bit short form (`1101`).
 The device must be known to BlueZ (paired).
@@ -109,7 +129,7 @@ another program cannot connect to that service through BlueZ.
 aio-rfcomm allows one Bluetooth object per process. This library opens it on
 first use and keeps it, on an event loop of its own in a background thread,
 and every caller in the process shares it: open links through
-{func}`~bluetooth_classic.open_rfcomm` rather than opening aio-rfcomm
+this library rather than opening aio-rfcomm
 directly. If something else in the process has already opened aio-rfcomm,
 connecting raises {class}`~bluetooth_classic.RfcommConnectError`. A process has at
 most one link to a device's service at a time: opening a second, while the
