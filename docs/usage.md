@@ -89,8 +89,8 @@ client = RfcommClient(
     disconnected_callback=on_disconnected,
 )
 await establish_rfcomm_connection(client, write_on_connect=QUERY)
-client.write_nowait(b"...")   # queue and return
-await client.write(b"...")    # wait until it is on its way
+client.write_nowait(b"...")  # queue and return
+await client.write(b"...")  # wait until it is on its way
 await client.disconnect()
 ```
 
