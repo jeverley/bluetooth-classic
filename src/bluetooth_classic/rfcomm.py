@@ -1,8 +1,8 @@
-"""A serialx handler for Bluetooth Classic RFCOMM services: ``rfcomm://`` URLs.
+"""RFCOMM links to Bluetooth Classic devices, through one aio-rfcomm owner.
 
-``rfcomm://00:11:22:33:44:55?service=1101`` opens that device's Serial Port
-service (``1101``) as a serial connection. ``service`` is a UUID, or its
-16- or 32-bit short form.
+:func:`open_rfcomm` opens a device's RFCOMM service, such as its Serial Port
+(``SERIAL_PORT``), and attaches an asyncio protocol, as
+``loop.create_connection()`` does for a socket.
 
 aio-rfcomm makes the connection: on Linux, BlueZ connects the service
 through its profile API, finds the channel itself and hands the connected
@@ -11,17 +11,15 @@ socket over. aio-rfcomm uses BlueZ's first adapter. Bytes given as
 else runs: some devices change state soon after a connection opens and only
 answer a request sent before then.
 
-aio-rfcomm allows one Bluetooth object per process. The handler opens it on
-first use and keeps it, on an event loop of its own in a background thread,
-so the opening bytes go out however busy the caller's loop is. Data passes
-between that loop and the caller's.
+aio-rfcomm allows one Bluetooth object per process. This module owns it,
+opened on first use, on an event loop of its own in a background thread, so
+the opening bytes go out however busy the caller's loop is; every caller in
+the process shares it, so open links through here rather than opening
+aio-rfcomm directly. Data passes between that loop and the caller's.
 
-An open link reports its service through ``get_extra_info("rfcomm_service")``
-and is listed by :func:`open_rfcomm_links` while open.
-
-Importing this module (or ``bluetooth_classic``) registers the handler with
-serialx's asyncio API (``serialx.create_serial_connection()``); its blocking
-``serial_for_url()`` refuses ``rfcomm://`` URLs.
+An open link reports its address and service through ``get_extra_info()``
+(``rfcomm_address``, ``rfcomm_service``) and is listed by
+:func:`open_rfcomm_links` while open.
 """
 
 from __future__ import annotations
@@ -30,11 +28,9 @@ import asyncio
 import concurrent.futures
 import contextlib
 import errno
-import io
 import logging
 import threading
 import time
-import urllib.parse
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -49,24 +45,15 @@ from aio_rfcomm.errors import (
     DeviceNotFoundError,
     RfcommError,
 )
-from serialx import (
-    BaseSerial,
-    BaseSerialTransport,
-    ModemPins,
-    Parity,
-    StopBits,
-    create_serial_connection,
-    register_uri_handler,
-)
-from serialx.platforms.serial_socket import SocketSerial
 
 from .client import normalize_address
 from .exceptions import RfcommConnectError
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEME = "rfcomm://"
 DEFAULT_CONNECT_TIMEOUT = 10.0
+# Seconds a close waits for queued bytes to be sent before dropping them.
+DRAIN_TIMEOUT = 2.0
 
 # The Bluetooth Base UUID, which 16- and 32-bit UUIDs are short forms of.
 _BASE_UUID = UUID("00000000-0000-1000-8000-00805f9b34fb")
@@ -100,8 +87,8 @@ def _from_short(value: int) -> UUID:
 
 
 @dataclass(frozen=True, slots=True)
-class RfcommTarget:
-    """What an ``rfcomm://`` URL connects to."""
+class _Target:
+    """A device's service to connect to."""
 
     address: str
     service: UUID
@@ -117,52 +104,6 @@ class RfcommLink:
     since: float = field(default_factory=time.monotonic)
 
 
-def rfcomm_url(address: str, *, service: UUID | str | int) -> str:
-    """Return the ``rfcomm://`` URL of a device's service.
-
-    Raises:
-        ValueError: A service that is not valid.
-    """
-    target = RfcommTarget(normalize_address(address), service_uuid(service))
-    query = urllib.parse.urlencode({"service": str(target.service)})
-    return f"{SCHEME}{target.address}?{query}"
-
-
-def parse_rfcomm_url(url: str) -> RfcommTarget:
-    """Return what an ``rfcomm://`` URL connects to.
-
-    A Bluetooth address has colons, so the URL cannot be parsed as host and
-    port; the service is a query parameter instead.
-
-    Raises:
-        ValueError: Not an ``rfcomm://`` URL with an address and a service,
-            given once, and nothing else.
-    """
-    if not url.startswith(SCHEME):
-        raise ValueError(f"Not an rfcomm:// URL: {url}")
-    address, _, query = url.removeprefix(SCHEME).partition("?")
-    params = urllib.parse.parse_qs(query, keep_blank_values=True)
-    for name, values in params.items():
-        if name == "adapter":
-            raise ValueError(
-                f"rfcomm:// cannot choose an adapter; aio-rfcomm uses BlueZ's "
-                f"first: {url}"
-            )
-        if name != "service":
-            raise ValueError(f"Unknown rfcomm:// parameter {name}: {url}")
-        if len(values) != 1:
-            raise ValueError(f"rfcomm:// {name} given more than once: {url}")
-        if not values[0]:
-            raise ValueError(f"rfcomm:// {name} is empty: {url}")
-    if "service" not in params:
-        raise ValueError(f"rfcomm:// needs a service: {url}")
-    try:
-        service = service_uuid(params["service"][0])
-    except ValueError as err:
-        raise ValueError(f"rfcomm:// service is not a UUID: {url}") from err
-    return RfcommTarget(normalize_address(address), service)
-
-
 # The link registry.
 
 _links: dict[int, RfcommLink] = {}
@@ -173,7 +114,7 @@ _listeners: list[Callable[[], None]] = []
 
 
 def open_rfcomm_links() -> list[RfcommLink]:
-    """Return the RFCOMM links this process has open through the handler."""
+    """Return the RFCOMM links this process has open."""
     with _links_lock:
         return list(_links.values())
 
@@ -352,7 +293,11 @@ class _Channel:
 
     async def _close(self) -> None:
         if self._sender is not None:
-            await asyncio.wait([self._sender])
+            # A device that stops reading must not hold the close forever.
+            _, pending = await asyncio.wait([self._sender], timeout=DRAIN_TIMEOUT)
+            if pending:
+                self._sender.cancel()
+                await asyncio.wait([self._sender])
         if self._reader is not None:
             self._reader.cancel()
             await asyncio.wait([self._reader])
@@ -363,7 +308,7 @@ class _Channel:
 
 
 async def _open_channel(
-    target: RfcommTarget, timeout: float | None, write_on_connect: bytes
+    target: _Target, timeout: float | None, write_on_connect: bytes
 ) -> _Channel:
     """Open the channel and send the opening bytes at once; background loop."""
     asked = time.monotonic()
@@ -394,7 +339,7 @@ async def _open_channel(
     return _Channel(stack, channel)
 
 
-def _log_failure(target: RfcommTarget, after: float, err: BaseException) -> None:
+def _log_failure(target: _Target, after: float, err: BaseException) -> None:
     """Log why a channel did not open, with what BlueZ said if known."""
     if isinstance(err, asyncio.CancelledError):
         _LOGGER.debug(
@@ -459,140 +404,90 @@ def _call_on(
     return call
 
 
-# The serialx handler.
+# Links.
 
 
-class RfcommSerial(SocketSerial):
-    """Serial settings for an ``rfcomm://`` URL; opening it blocking is refused.
-
-    aio-rfcomm needs an event loop: use serialx's asyncio API.
-    """
+class RfcommTransport(asyncio.Transport):
+    """An open RFCOMM link, passing data between aio-rfcomm and a protocol."""
 
     def __init__(
         self,
-        *args: Any,
-        connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT,
-        write_on_connect: bytes = b"",
-        **kwargs: Any,
+        loop: asyncio.AbstractEventLoop,
+        protocol: asyncio.Protocol,
+        channel: _Channel,
+        target: _Target,
     ) -> None:
-        """Initialise from an ``rfcomm://`` URL; the baud rate is ignored."""
-        # SocketSerial's own initialiser parses a host and port.
-        BaseSerial.__init__(self, *args, **kwargs)
-        self._target = parse_rfcomm_url(str(self._path))
-        self._connect_timeout = connect_timeout
-        self._write_on_connect = bytes(write_on_connect)
-        self._socket = None
-
-    def _open(self) -> None:
-        """Refuse: only serialx's asyncio API can open ``rfcomm://`` URLs."""
-        raise io.UnsupportedOperation(
-            "rfcomm:// supports only serialx's asyncio API (create_serial_connection)"
+        """Not made directly: :func:`open_rfcomm` makes it."""
+        super().__init__(
+            {"rfcomm_address": target.address, "rfcomm_service": target.service}
         )
-
-
-class RfcommSerialTransport(BaseSerialTransport):
-    """Serial transport over an RFCOMM service that aio-rfcomm opened."""
-
-    transport_name = "rfcomm"
-
-    def __init__(
-        self, loop: asyncio.AbstractEventLoop, protocol: asyncio.Protocol
-    ) -> None:
-        """Initialise the transport."""
-        super().__init__(loop, protocol)
-        self._channel: _Channel | None = None
-        self._busy: tuple[str, UUID] | None = None
+        self._loop = loop
+        self._protocol = protocol
+        self._channel = channel
+        self._busy: tuple[str, UUID] | None = (target.address, target.service)
+        self._closing = False
+        self._lost = False
         # Why the link ended, if the device or Bluetooth ended it.
         self._ended: Exception | None = None
         self._unsent = 0
-        self._sent = asyncio.Event()
-        self._sent.set()
 
-    async def _connect(  # type: ignore[override]
-        self,
-        *,
-        path: str,
-        baudrate: int,
-        parity: Parity = Parity.NONE,
-        stopbits: StopBits | int | float = StopBits.ONE,
-        xonxoff: bool = False,
-        rtscts: bool = False,
-        byte_size: int = 8,
-        connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT,
-        write_on_connect: bytes = b"",
-        **kwargs: Any,
-    ) -> None:
-        serial = RfcommSerial(
-            path=path,
-            baudrate=baudrate,
-            parity=parity,
-            stopbits=stopbits,
-            xonxoff=xonxoff,
-            rtscts=rtscts,
-            byte_size=byte_size,
-            connect_timeout=connect_timeout,
-            write_on_connect=write_on_connect,
-        )
-        self._serial = serial
-        self._extra["serial"] = serial
-        target = serial._target
-
-        key = (target.address, target.service)
-        with _links_lock:
-            if key in _busy:
-                raise RfcommConnectError(
-                    f"{target.address} already has a link to {target.service}"
-                )
-            _busy.add(key)
-        self._busy = key
-
-        bg = _owner.loop()
-        opening = asyncio.run_coroutine_threadsafe(
-            _open_channel(target, connect_timeout, serial._write_on_connect), bg
-        )
-        waiting = asyncio.wrap_future(opening)
-        try:
-            channel = await asyncio.shield(waiting)
-        except asyncio.CancelledError:
-            # Left to finish on the background loop, then closed; the device
-            # service stays busy until then. Its outcome is read here, so
-            # nothing is logged as never retrieved.
-            self._busy = None
-            waiting.add_done_callback(_ignore_outcome)
-            opening.add_done_callback(lambda done: _abandon(done, key))
-            raise
-        except RfcommError as err:
-            hint = ""
-            if isinstance(err, DeviceNotFoundError):
-                hint = (
-                    " (aio-rfcomm uses BlueZ's first adapter: is the device "
-                    "paired on it?)"
-                )
-            raise RfcommConnectError(
-                f"{target.address}'s service {target.service} could not be "
-                f"opened: {err}{hint}"
-            ) from err
-        self._channel = channel
-        bg.call_soon_threadsafe(
-            channel.start,
+    def _start(self) -> None:
+        """Pass data on from now: the protocol has been told the link opened."""
+        _owner.loop().call_soon_threadsafe(
+            self._channel.start,
             _call_on(self._loop, self._deliver),
             _call_on(self._loop, self._on_sent),
             _call_on(self._loop, self._end),
         )
-        self._extra["rfcomm_service"] = target.service
-        _add_link(id(self), RfcommLink(target.address, target.service))
-        # Data is passed on from the caller's loop, so none can reach the
-        # protocol before this.
-        self._call_protocol_connection_made()
+
+    def get_protocol(self) -> asyncio.BaseProtocol:
+        """Return the protocol."""
+        return self._protocol
+
+    def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
+        """Pass data to another protocol."""
+        assert isinstance(protocol, asyncio.Protocol)
+        self._protocol = protocol
+
+    def is_closing(self) -> bool:
+        """Return whether the link is closing or closed."""
+        return self._closing
+
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        """Send data, in order."""
+        if self._closing or not data:
+            return
+        chunk = bytes(data)
+        self._unsent += len(chunk)
+        _owner.loop().call_soon_threadsafe(self._channel.send, chunk)
+
+    def can_write_eof(self) -> bool:
+        """RFCOMM has no half close."""
+        return False
+
+    def get_write_buffer_size(self) -> int:
+        """Return the number of bytes queued but not yet sent."""
+        return self._unsent
+
+    def close(self) -> None:
+        """Close once what is queued has been sent (at most DRAIN_TIMEOUT)."""
+        if self._closing:
+            return
+        self._closing = True
+        self._close_channel(drain=True, then_finish=True)
+
+    def abort(self) -> None:
+        """Close at once, dropping what is queued."""
+        first = not self._closing
+        self._closing = True
+        self._close_channel(drain=False, then_finish=first)
 
     def _deliver(self, data: bytes) -> None:
-        if not self._connection_lost_called:
+        if not self._lost:
             self._protocol.data_received(data)
 
     def _on_sent(self, count: int) -> None:
         self._unsent = max(0, self._unsent - count)
-        if not self._unsent:
-            self._sent.set()
 
     def _end(self, exc: Exception) -> None:
         """The device or Bluetooth ended the link."""
@@ -600,48 +495,16 @@ class RfcommSerialTransport(BaseSerialTransport):
             return
         self._closing = True
         self._ended = exc
-        self._mark_broken(exc)
         # Reported at once; the device service is freed once the channel
         # has closed behind it, so a new link cannot race its teardown.
         self._report_lost()
         self._close_channel(drain=False, then_finish=False, then_free=True)
 
-    def write(self, data: bytes | bytearray | memoryview) -> None:
-        """Send data, in order."""
-        self._check_broken()
-        if self._closing or self._channel is None or not data:
-            return
-        chunk = bytes(data)
-        self._unsent += len(chunk)
-        self._sent.clear()
-        _owner.loop().call_soon_threadsafe(self._channel.send, chunk)
-
-    def close(self) -> None:
-        """Close once what is queued has been sent."""
-        if self._closing:
-            return
-        self._closing = True
-        self._mark_user_closed()
-        self._arm_close_timeout()
-        self._close_channel(drain=True, then_finish=True)
-
-    def abort(self) -> None:
-        """Close at once, dropping what is queued."""
-        first = not self._closing
-        self._closing = True
-        self._mark_user_closed()
-        self._close_channel(drain=False, then_finish=first)
-
     def _close_channel(
         self, *, drain: bool, then_finish: bool, then_free: bool = False
     ) -> None:
-        channel = self._channel
-        if channel is None:
-            if then_finish or then_free:
-                self._finish()
-            return
         closing = asyncio.run_coroutine_threadsafe(
-            channel.close(drain=drain), _owner.loop()
+            self._channel.close(drain=drain), _owner.loop()
         )
         if then_finish:
             finish = _call_on(self._loop, self._finish)
@@ -661,26 +524,22 @@ class RfcommSerialTransport(BaseSerialTransport):
             self._busy = None
 
     def _report_lost(self) -> None:
+        if self._lost:
+            return
+        self._lost = True
         _remove_link(id(self))
         self._unsent = 0
-        self._sent.set()
-        self._call_protocol_connection_lost(self._ended)
-
-    def get_write_buffer_size(self) -> int:
-        """Return the number of bytes queued but not yet sent."""
-        return self._unsent
-
-    async def _flush(self) -> None:
-        await self._sent.wait()
-
-    async def _get_modem_pins(self) -> ModemPins:
-        return ModemPins()
-
-    async def _set_modem_pins(self, modem_pins: ModemPins) -> None:
-        """RFCOMM has no modem pins to set."""
-
-    async def _reconfigure_port(self, update: Any) -> None:
-        """RFCOMM has no port settings."""
+        try:
+            self._protocol.connection_lost(self._ended)
+        except Exception as err:
+            self._loop.call_exception_handler(
+                {
+                    "message": "protocol.connection_lost() failed",
+                    "exception": err,
+                    "transport": self,
+                    "protocol": self._protocol,
+                }
+            )
 
 
 def _ignore_outcome(waiting: asyncio.Future[_Channel]) -> None:
@@ -702,26 +561,6 @@ def _abandon(
     closing.add_done_callback(lambda _: _release(key))
 
 
-def _register() -> None:
-    """Register the handler, unless another copy of it already has."""
-    try:
-        register_uri_handler(
-            scheme=SCHEME,
-            unique_scheme=SCHEME,
-            sync_cls=RfcommSerial,
-            async_transport_cls=RfcommSerialTransport,
-            connect_kwargs=frozenset({"connect_timeout", "write_on_connect"}),
-        )
-    except ValueError:
-        # serialx refuses a second handler for a scheme; one registered by
-        # another copy of this module (imported under another name, or
-        # vendored) serves just as well.
-        _LOGGER.debug("An rfcomm:// handler is already registered")
-
-
-_register()
-
-
 async def open_rfcomm(
     address: str,
     protocol_factory: Callable[[], asyncio.Protocol],
@@ -729,31 +568,72 @@ async def open_rfcomm(
     service: UUID | str | int,
     timeout: float | None = DEFAULT_CONNECT_TIMEOUT,
     write_on_connect: bytes = b"",
-) -> tuple[asyncio.Transport, asyncio.Protocol]:
-    """Open a device's RFCOMM service through serialx; attach a protocol.
-
-    A shortcut for ``serialx.create_serial_connection()`` with an
-    ``rfcomm://`` URL.
+) -> tuple[RfcommTransport, asyncio.Protocol]:
+    """Open a device's RFCOMM service and attach a protocol.
 
     Args:
         address: The device's address. BlueZ must know it (paired).
         protocol_factory: Returns the protocol to attach.
-        service: The service to connect to, such as ``SERIAL_PORT``.
+        service: The service to connect to, such as ``SERIAL_PORT``: a UUID,
+            or its 16- or 32-bit short form.
         timeout: Seconds to wait for the link to open.
         write_on_connect: Bytes sent the moment the channel opens, before
             the protocol is attached. Replies wait until it is.
 
     Raises:
-        ValueError: A service that is not valid.
-        RfcommConnectError: The service could not be opened, or the device
-            already has a link to it.
+        ValueError: An address or service that is not valid.
+        RfcommConnectError: The service could not be opened, the device
+            already has a link to it, or aio-rfcomm is open elsewhere in
+            this process.
         TimeoutError: No connection within ``timeout`` seconds.
     """
-    return await create_serial_connection(
-        asyncio.get_running_loop(),
-        protocol_factory,
-        rfcomm_url(address, service=service),
-        baudrate=9600,  # Required by serialx; RFCOMM has no baud rate.
-        connect_timeout=timeout,
-        write_on_connect=write_on_connect,
+    loop = asyncio.get_running_loop()
+    target = _Target(normalize_address(address), service_uuid(service))
+    key = (target.address, target.service)
+    with _links_lock:
+        if key in _busy:
+            raise RfcommConnectError(
+                f"{target.address} already has a link to {target.service}"
+            )
+        _busy.add(key)
+
+    opening = asyncio.run_coroutine_threadsafe(
+        _open_channel(target, timeout, bytes(write_on_connect)), _owner.loop()
     )
+    waiting = asyncio.wrap_future(opening)
+    try:
+        channel = await asyncio.shield(waiting)
+    except asyncio.CancelledError:
+        # Left to finish on the background loop, then closed; the device
+        # service stays busy until then. Its outcome is read here, so
+        # nothing is logged as never retrieved.
+        waiting.add_done_callback(_ignore_outcome)
+        opening.add_done_callback(lambda done: _abandon(done, key))
+        raise
+    except RfcommError as err:
+        _release(key)
+        hint = ""
+        if isinstance(err, DeviceNotFoundError):
+            hint = (
+                " (aio-rfcomm uses BlueZ's first adapter: is the device paired on it?)"
+            )
+        raise RfcommConnectError(
+            f"{target.address}'s service {target.service} could not be "
+            f"opened: {err}{hint}"
+        ) from err
+    except BaseException:
+        _release(key)
+        raise
+
+    try:
+        protocol = protocol_factory()
+    except BaseException:
+        _abandon(opening, key)
+        raise
+    transport = RfcommTransport(loop, protocol, channel, target)
+    _add_link(id(transport), RfcommLink(target.address, target.service))
+    # Data is passed on from this loop, so none can reach the protocol
+    # before this.
+    protocol.connection_made(transport)
+    transport._start()
+    return transport, protocol

@@ -1,4 +1,4 @@
-"""Bluetooth Classic discovery, pairing and RFCOMM serial on Linux."""
+"""Bluetooth Classic discovery, pairing and RFCOMM links on Linux."""
 
 __version__ = "0.7.2"
 
@@ -15,12 +15,10 @@ from .models import ClassicDevice
 from .rfcomm import (
     SERIAL_PORT,
     RfcommLink,
-    RfcommTarget,
+    RfcommTransport,
     on_rfcomm_links_changed,
     open_rfcomm,
     open_rfcomm_links,
-    parse_rfcomm_url,
-    rfcomm_url,
     service_uuid,
 )
 
@@ -38,12 +36,10 @@ __all__ = [
     "PairingError",
     "RfcommConnectError",
     "RfcommLink",
-    "RfcommTarget",
+    "RfcommTransport",
     "normalize_address",
     "on_rfcomm_links_changed",
     "open_rfcomm",
     "open_rfcomm_links",
-    "parse_rfcomm_url",
-    "rfcomm_url",
     "service_uuid",
 ]

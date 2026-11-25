@@ -68,7 +68,7 @@ ends. Keep scans short, and in an
 application that also scans for Low Energy devices, let one part of it
 decide when they run.
 
-## Serial connections (RFCOMM)
+## RFCOMM links
 
 RFCOMM carries a device's serial-style services: the Serial Port Profile
 (`1101`), Dial-up Networking (`1103`), the OBEX services and vendors' own
@@ -76,27 +76,23 @@ services with 128-bit UUIDs. Audio, input devices and networking (A2DP,
 AVRCP, HID, PAN) use L2CAP directly, not RFCOMM. Leave Headset and
 Hands-Free (`1108`, `111e`) to BlueZ and the audio system.
 
-Importing `bluetooth_classic` registers an `rfcomm://` handler with
-[serialx](https://github.com/puddly/serialx)'s asyncio API, so it opens a
-device's RFCOMM service like any serial port:
+{func}`~bluetooth_classic.open_rfcomm` opens a device's RFCOMM service and
+attaches a protocol, as asyncio's `loop.create_connection()` does for a
+socket:
 
 ```python
-transport, protocol = await serialx.create_serial_connection(
-    loop, MyProtocol, "rfcomm://00:11:22:33:44:55?service=1101", baudrate=9600
+transport, protocol = await open_rfcomm(
+    "00:11:22:33:44:55", MyProtocol, service=SERIAL_PORT
 )
 ```
 
-The baud rate is required by serialx and ignored. The URL takes:
-
-- `service`: the service's UUID, or its 16- or 32-bit short form (`1101`).
+`service` is the service's UUID, or its 16- or 32-bit short form (`1101`).
+The device must be known to BlueZ (paired).
 
 aio-rfcomm uses BlueZ's first adapter; there is no option to choose one.
 {class}`~bluetooth_classic.BluetoothClassic` pairs on the first powered
 adapter, so on a machine with several adapters, pair the device on BlueZ's
 first, or the link cannot be opened.
-
-The device must be known to BlueZ (paired). serialx's blocking
-`serial_for_url()` refuses `rfcomm://` URLs.
 
 Link security is BlueZ's for client profiles: there is no option for it.
 Whether BlueZ asks for an encrypted link by default is unconfirmed.
@@ -110,16 +106,17 @@ connected socket over D-Bus. Links within one process share the
 registration; BlueZ accepts one per service UUID, so while one is open,
 another program cannot connect to that service through BlueZ.
 
-aio-rfcomm allows one Bluetooth object per process. The handler opens it on
-first use and keeps it, on an event loop of its own in a background thread;
-if something else in the process has already opened aio-rfcomm, connecting
-raises {class}`~bluetooth_classic.RfcommConnectError`. A process has at
+aio-rfcomm allows one Bluetooth object per process. This library opens it on
+first use and keeps it, on an event loop of its own in a background thread,
+and every caller in the process shares it: open links through
+{func}`~bluetooth_classic.open_rfcomm` rather than opening aio-rfcomm
+directly. If something else in the process has already opened aio-rfcomm,
+connecting raises {class}`~bluetooth_classic.RfcommConnectError`. A process has at
 most one link to a device's service at a time: opening a second, while the
 first is open or opening, raises it too.
 
-Two connection options are also accepted: `connect_timeout`, which bounds
-the whole open, and `write_on_connect`, bytes sent from the handler's own
-loop the moment the channel opens, however busy the application's loop is.
+Two options are also accepted: `timeout`, which bounds the whole open, and
+`write_on_connect`, bytes sent from the library's own loop the moment the channel opens, however busy the application's loop is.
 Use it for a device that changes state soon after a connection opens and
 only answers a request sent before then.
 
@@ -128,10 +125,12 @@ gets a `ConnectionResetError` (`ECONNRESET`): aio-rfcomm does not say why a
 link ended, as RFCOMM reports even an orderly hang-up as a reset. Bluetooth
 itself going away gives a `ConnectionAbortedError` instead.
 
-An open connection reports its service through `get_extra_info()`
-(`rfcomm_service`). {func}`~bluetooth_classic.open_rfcomm_links` lists the
-links open through the handler, and
+Closing sends what is queued first, waiting at most two seconds for a
+device that has stopped reading; `abort()` drops it.
+
+An open link reports its address and service through `get_extra_info()`
+(`rfcomm_address`, `rfcomm_service`). {func}`~bluetooth_classic.open_rfcomm_links`
+lists the open links, and
 {func}`~bluetooth_classic.on_rfcomm_links_changed` calls back whenever one
 opens or closes.
 
-{func}`~bluetooth_classic.open_rfcomm` is a shortcut that builds the URL.

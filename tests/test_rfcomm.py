@@ -1,13 +1,11 @@
-"""Tests for the rfcomm:// serialx handler, with a fake aio-rfcomm."""
+"""Tests for RFCOMM links, with a fake aio-rfcomm."""
 
 from __future__ import annotations
 
 import asyncio
 import errno
 import gc
-import io
 import logging
-import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -17,7 +15,6 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
-import serialx
 from aio_rfcomm import Availability
 from aio_rfcomm.errors import (
     BluetoothAlreadyOpenError,
@@ -30,26 +27,20 @@ from aio_rfcomm.errors import (
 from bluetooth_classic import (
     SERIAL_PORT,
     RfcommConnectError,
+    rfcomm,
     service_uuid,
 )
 from bluetooth_classic.rfcomm import (
     RfcommLink,
-    RfcommTarget,
     on_rfcomm_links_changed,
     open_rfcomm,
     open_rfcomm_links,
-    parse_rfcomm_url,
-    rfcomm_url,
 )
 
 from .conftest import SPEAKER_ADDRESS
 
-URL = f"rfcomm://{SPEAKER_ADDRESS}?service=1101"
 OTHER = "66:77:88:99:AA:BB"
 REQUEST = b"hello"
-
-# serialx uses whichever copy of the module registered first; patch that one.
-rfcomm = sys.modules[serialx.common.get_uri_handler(URL).async_transport_cls.__module__]
 
 
 class _Recorder(asyncio.Protocol):
@@ -159,9 +150,9 @@ def bluetooth() -> Iterator[FakeBluetooth]:
     rfcomm._links.clear()
 
 
-async def _open(url: str = URL, **kwargs: Any) -> tuple[Any, _Recorder]:
-    transport, protocol = await serialx.create_serial_connection(
-        asyncio.get_running_loop(), _Recorder, url, baudrate=9600, **kwargs
+async def _open(address: str = SPEAKER_ADDRESS, **kwargs: Any) -> tuple[Any, _Recorder]:
+    transport, protocol = await open_rfcomm(
+        address, _Recorder, service=SERIAL_PORT, **kwargs
     )
     assert isinstance(protocol, _Recorder)
     return transport, protocol
@@ -188,44 +179,13 @@ def test_service_uuids() -> None:
         service_uuid("serial")
 
 
-def test_urls() -> None:
-    url = rfcomm_url("00-11-22-33-44-55", service="1101")
-    assert url == (
-        f"rfcomm://{SPEAKER_ADDRESS}?service=00001101-0000-1000-8000-00805f9b34fb"
-    )
-    assert parse_rfcomm_url(url) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT)
-    assert parse_rfcomm_url(URL) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "socket://00:11:22:33:44:55?service=1101",
-        "rfcomm://00:11:22:33:44:55",
-        "rfcomm://00:11:22:33:44:55?channel=1",
-        "rfcomm://00:11:22:33:44:55?service=1101&security=medium",
-        "rfcomm://00:11:22:33:44:55?service=serial",
-        "rfcomm://00:11:22:33:44:55?service=",
-        "rfcomm://00:11:22:33:44:55?service=1101&service=1102",
-        "rfcomm://00:11:22:33:44:55?service=1101&adapter=hci0",
-        "rfcomm://not-an-address?service=1101",
-    ],
-)
-def test_bad_urls(url: str) -> None:
-    with pytest.raises(ValueError):
-        parse_rfcomm_url(url)
-
-
-def test_the_service_is_a_uuid() -> None:
-    assert isinstance(parse_rfcomm_url(URL).service, UUID)
-
-
 async def test_the_request_goes_first(bluetooth: FakeBluetooth) -> None:
     transport, protocol = await _open(write_on_connect=REQUEST)
     [channel] = bluetooth.channels
     assert (channel.address, channel.service) == (SPEAKER_ADDRESS, SERIAL_PORT)
     assert channel.sent == [REQUEST]
     assert transport.get_extra_info("rfcomm_service") == SERIAL_PORT
+    assert transport.get_extra_info("rfcomm_address") == SPEAKER_ADDRESS
     transport.write(b"more")
     await _until(lambda: channel.sent == [REQUEST, b"more"])
     bluetooth.from_device(channel, b"reply")
@@ -237,7 +197,7 @@ async def test_the_request_goes_first(bluetooth: FakeBluetooth) -> None:
 
 async def test_aio_rfcomm_is_opened_once(bluetooth: FakeBluetooth) -> None:
     first = await _open()
-    second = await _open(f"rfcomm://{OTHER}?service=1101")
+    second = await _open(OTHER)
     assert bluetooth.opened == 1
     await _close(*first)
     await _close(*second)
@@ -302,7 +262,7 @@ async def test_a_second_link_to_a_device_is_refused(bluetooth: FakeBluetooth) ->
     assert len(bluetooth.channels) == 1
     assert not protocol.lost.is_set()
     # Another device can be connected meanwhile.
-    await _close(*await _open(f"rfcomm://{OTHER}?service=1101"))
+    await _close(*await _open(OTHER))
     await _close(transport, protocol)
     # Once closed, the device can be connected again.
     await _close(*await _open())
@@ -362,7 +322,7 @@ async def test_a_timeout_is_logged_as_one(
         caplog.at_level(logging.DEBUG, logger=rfcomm.__name__),
         pytest.raises(TimeoutError),
     ):
-        await _open(connect_timeout=0.05)
+        await _open(timeout=0.05)
     [record] = [r for r in caplog.records if "Could not open" in r.getMessage()]
     assert "TimeoutError" in record.getMessage()
     assert "Cancelled" not in record.getMessage()
@@ -406,7 +366,7 @@ async def test_aio_rfcomm_open_elsewhere(bluetooth: FakeBluetooth) -> None:
 async def test_no_connection_in_time(bluetooth: FakeBluetooth) -> None:
     bluetooth.hang = True
     with pytest.raises(TimeoutError):
-        await _open(connect_timeout=0.05)
+        await _open(timeout=0.05)
     bluetooth.hang = False
     await _close(*await _open())
 
@@ -468,24 +428,31 @@ async def test_abort_drops_what_is_queued(bluetooth: FakeBluetooth) -> None:
     assert channel.closed.is_set()
 
 
-async def test_flush_waits_until_sent(bluetooth: FakeBluetooth) -> None:
+async def test_a_bad_service_is_refused() -> None:
+    with pytest.raises(ValueError):
+        await open_rfcomm(SPEAKER_ADDRESS, _Recorder, service="serial")
+
+
+async def test_sent_bytes_leave_the_write_buffer(bluetooth: FakeBluetooth) -> None:
     transport, protocol = await _open()
     [channel] = bluetooth.channels
     transport.write(b"data")
-    await asyncio.wait_for(transport.flush(), 1)
+    assert transport.get_write_buffer_size() == 4
+    await _until(lambda: transport.get_write_buffer_size() == 0)
     assert channel.sent == [b"data"]
-    assert transport.get_write_buffer_size() == 0
     await _close(transport, protocol)
 
 
-def test_blocking_use_is_refused() -> None:
-    port = serialx.serial_for_url(URL, baudrate=9600)
-    with pytest.raises(io.UnsupportedOperation):
-        port.open()
-
-
-async def test_write_on_connect_is_only_for_rfcomm() -> None:
-    # serialx drops it for other backends rather than failing.
-    handler = serialx.common.get_uri_handler("socket://localhost:1")
-    routed = serialx.common.route_backend_kwargs(handler, {"write_on_connect": REQUEST})
-    assert routed == {}
+async def test_a_close_drops_what_a_stalled_device_does_not_take(
+    bluetooth: FakeBluetooth,
+) -> None:
+    transport, protocol = await _open()
+    [channel] = bluetooth.channels
+    bluetooth.on_loop(channel.sending.clear)
+    await asyncio.sleep(0.01)
+    transport.write(b"stuck")
+    with patch.object(rfcomm, "DRAIN_TIMEOUT", 0.05):
+        transport.close()
+        await asyncio.wait_for(protocol.lost.wait(), 1)
+    assert channel.sent == []
+    assert channel.closed.is_set()

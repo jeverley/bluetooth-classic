@@ -2,7 +2,7 @@
 name = "bluetooth-classic"
 version = "0.7.2"
 license = "Apache-2.0"
-description = "Bluetooth Classic (BR/EDR) discovery, pairing, scans and RFCOMM serial connections on Linux"
+description = "Bluetooth Classic (BR/EDR) discovery, pairing, scans and RFCOMM links on Linux"
 authors = [{ name = "jeverley", email = "46714706+jeverley@users.noreply.github.com" }]
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,7 +33,6 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.15"
 dbus-fast = ">=2.0.0"
-serialx = ">=1.15.1"
 aio-rfcomm = ">=1.1.0"
 
 # Documentation Dependencies

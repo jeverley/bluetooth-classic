@@ -2,10 +2,10 @@
 
 `bluetooth-classic`: Bluetooth Classic (BR/EDR) discovery, pairing, trust
 and finding one device on Linux, through BlueZ over D-Bus with dbus-fast, and RFCOMM
-serial connections, made by BlueZ, through a serialx `rfcomm://` handler. It holds what
-Classic devices need that Home Assistant's Bluetooth libraries do not, so
-each piece can later move to the library it belongs in (discovery and
-scans to habluetooth, pairing to bleak, `rfcomm://` to serialx). Generic:
+links through aio-rfcomm, as the one aio-rfcomm owner in a process. It holds
+what Classic devices need that Home Assistant's Bluetooth libraries do not,
+standing in for Home Assistant's `bluetooth` integration, which is meant to
+absorb it (discovery, scans, pairing and the aio-rfcomm owner). Generic:
 it knows nothing about any one kind of device or application. It is meant to
 fit alongside Home Assistant's Bluetooth libraries (the Bluetooth-Devices
 organisation), so it follows their layout and tooling: Poetry, `src/`
@@ -25,19 +25,16 @@ Read the Docs.
 - Method names and parameters follow bleak's where there is an equivalent
   (`discover(timeout=)`, `find_device_by_address()`, `pair()`, `unpair()`,
   `async with`).
-- Connections: only the generic `rfcomm://` serialx handler. No device
-  protocols; callers bring their own.
-- The `rfcomm://` handler gets its connections from aio-rfcomm (BlueZ's
-  profile API on Linux), the way serialx's `esphome://` uses
-  `aioesphomeapi`. aio-rfcomm allows one Bluetooth object per process: the
-  handler owns it, on its own event loop in a background thread, so
-  `write_on_connect` is sent the moment the channel opens however busy the
-  caller's loop is. No Bluetooth or D-Bus code of our own for it, no
-  channel-only URLs, and only serialx's asyncio API. Open links are
-  listed, so they can later be shown alongside Home Assistant's Bluetooth
-  devices and connections.
-- The handler is meant to move to serialx; this library then drops it
-  (no re-export), keeping discovery, scans and pairing.
+- Connections: only generic RFCOMM links (`open_rfcomm()`, shaped like
+  asyncio's `create_connection()`). No device protocols; callers bring
+  their own.
+- Links come from aio-rfcomm (BlueZ's profile API on Linux). aio-rfcomm
+  allows one Bluetooth object per process: this library owns it, on its
+  own event loop in a background thread, and every caller in the process
+  shares it, so `write_on_connect` is sent the moment the channel opens
+  however busy the caller's loop is. No Bluetooth or D-Bus code of our own
+  for links, and no serialx. Open links are listed, so they can later be
+  shown alongside Home Assistant's Bluetooth devices and connections.
 - `agent.py` must not use
   `from __future__ import annotations`: dbus-fast reads the D-Bus
   signatures from the method annotations.

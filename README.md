@@ -53,11 +53,12 @@ asyncio event loop, without compiled extensions.
 
 Method names follow [bleak](https://github.com/hbldh/bleak)'s where there is
 an equivalent.
-- **Connect** to a device's RFCOMM service, such as its serial port, through
-  [serialx](https://github.com/puddly/serialx) with `rfcomm://` URLs.
+- **Connect** to a device's RFCOMM service, such as its serial port, as an
+  asyncio transport and protocol.
   [aio-rfcomm](https://github.com/dlech/aio-rfcomm) makes the connection
-  (through BlueZ's profile API), and bytes to send on connect go out from a
-  thread of its own the moment the channel opens.
+  (through BlueZ's profile API); this library is the one aio-rfcomm owner
+  in the process, shared by every caller, and bytes to send on connect go
+  out from a thread of its own the moment the channel opens.
 
 It covers what a Classic device needs that the usual Python Bluetooth
 libraries do not, and nothing about any one kind of device.
@@ -75,9 +76,7 @@ It needs Linux with BlueZ 5, and Python 3.11 or newer.
 ```python
 import asyncio
 
-import serialx
-
-from bluetooth_classic import BluetoothClassic
+from bluetooth_classic import SERIAL_PORT, BluetoothClassic, open_rfcomm
 
 
 async def main() -> None:
@@ -91,11 +90,12 @@ async def main() -> None:
         found = await bluetooth.find_device_by_address(device.address)
         print("on" if found else "off")
 
-    # The device's Serial Port service (0x1101), as a serialx connection,
-    # connected by BlueZ.
-    reader, writer = await serialx.open_serial_connection(
-        "rfcomm://00:11:22:33:44:55?service=1101", baudrate=9600
+    # The device's Serial Port service, connected by BlueZ, with a protocol
+    # attached as asyncio's create_connection() does.
+    transport, protocol = await open_rfcomm(
+        "00:11:22:33:44:55", asyncio.Protocol, service=SERIAL_PORT
     )
+    transport.close()
 
 
 asyncio.run(main())
