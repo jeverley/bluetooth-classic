@@ -1,6 +1,69 @@
 # CHANGELOG
 
 
+## v0.8.0 (2026-11-25)
+
+### Code Style
+
+- Format the RFCOMM tests
+  ([`90b98b0`](https://github.com/jeverley/bluetooth-classic/commit/90b98b0d986e12994be4de17def5786d96888c65))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Documentation
+
+- End the usage guide with a single newline
+  ([`8731928`](https://github.com/jeverley/bluetooth-classic/commit/873192834407a2afb4b4e91cd757beecee98c6ba))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Features
+
+- Add RfcommClient and establish_rfcomm_connection(), shaped like bleak
+  ([`1dc1480`](https://github.com/jeverley/bluetooth-classic/commit/1dc1480d2a265ff5e9a3131ac0efc4f509dffe91))
+
+RfcommClient connects to a device's RFCOMM service as bleak's BleakClient does: connect(), write()
+  and write_nowait(), disconnect(), a data callback from the first byte and a disconnected callback.
+  establish_rfcomm_connection() connects one, retrying while BlueZ says the device is busy, as
+  bleak-retry-connector's establish_connection() does; such failures are raised with errno EBUSY.
+  Both sit on create_rfcomm_connection().
+
+BREAKING CHANGE: open_rfcomm() is renamed create_rfcomm_connection(), following asyncio's
+  create_connection(), which it is shaped like.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+- Open RFCOMM links directly, without serialx
+  ([`50212b7`](https://github.com/jeverley/bluetooth-classic/commit/50212b75bfd59088b24589716dffda99766aed6d))
+
+open_rfcomm() opens a device's RFCOMM service through this library's aio-rfcomm owner and attaches a
+  protocol, as asyncio's create_connection() does, returning an RfcommTransport. Every caller in a
+  process shares the one aio-rfcomm owner, so open links through here rather than opening aio-rfcomm
+  directly. Closing sends what is queued first, for at most two seconds. Links report their address
+  and service.
+
+BREAKING CHANGE: the serialx rfcomm:// handler is removed, with rfcomm_url(), parse_rfcomm_url() and
+  RfcommTarget, and serialx is no longer a dependency. Use open_rfcomm(); its timeout option is
+  timeout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+- Read establish_rfcomm_connection()'s attempts and delay when called
+  ([`e52db3b`](https://github.com/jeverley/bluetooth-classic/commit/e52db3b54ebadae31187a9148ca23660443042ac))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.7.2 (2026-11-25)
 
 ### Bug Fixes
