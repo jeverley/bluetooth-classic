@@ -385,7 +385,11 @@ def _abandon(
 
 
 class RfcommConnection:
-    """A connection to a device's RFCOMM service (a data link connection).
+    """A connection to one of a device's RFCOMM services (a data link connection).
+
+    It is one service connection on the device's link, which BlueZ brings up
+    when it opens and keeps while any service on the device needs it:
+    closing this connection ends only this connection.
 
     Open it with :meth:`open`, or with :func:`establish_rfcomm_connection`
     to retry while the device is busy. Data the device sends is passed to

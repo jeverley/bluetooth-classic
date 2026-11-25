@@ -50,18 +50,55 @@ asyncio event loop, without compiled extensions.
   Classic scan that never connects to it, so it does not wake a device that
   wakes when connected to.
 - **Unpair** a device, removing it from BlueZ.
-
-Method names follow [bleak](https://github.com/hbldh/bleak)'s where there is
-an equivalent.
-- **Connect** to a device's RFCOMM service, such as its serial port, with a
-  client shaped like bleak's `BleakClient`.
-  [aio-rfcomm](https://github.com/dlech/aio-rfcomm) makes the connection
-  (through BlueZ's profile API); this library is the one aio-rfcomm owner
-  in the process, shared by every caller, and bytes to send on connect go
-  out from a thread of its own the moment the channel opens.
+- **Open a connection** to one of a device's RFCOMM services, such as its
+  serial port, made by [aio-rfcomm](https://github.com/dlech/aio-rfcomm)
+  through BlueZ's profile API.
 
 It covers what a Classic device needs that the usual Python Bluetooth
-libraries do not, and nothing about any one kind of device.
+libraries do not, and nothing about any one kind of device. Method names
+follow [bleak](https://github.com/hbldh/bleak)'s where there is an
+equivalent.
+
+## Devices, links and service connections
+
+A Bluetooth Classic device is reached in layers, and each operation here
+acts on one of them.
+
+- **The device.** It is found by a scan, then paired and trusted, which
+  BlueZ remembers. `BluetoothClassic` works at this level: `discover()`,
+  `find_device_by_address()`, `pair()`, `trust()`, `unpair()`. None of them
+  connects to the device; a scan only listens.
+- **The link.** When anything needs to talk to the device, BlueZ connects a
+  link to it (the device's connection). One link carries all the services
+  in use on that device at once: an RFCOMM connection, audio, a keyboard.
+  BlueZ owns it: it brings the link up when the first service needs it and
+  takes it down a little after the last one is done. This library never
+  connects or disconnects a device's link itself.
+- **A service connection.** A device offers services, each identified by a
+  UUID, such as its Serial Port (`1101`). An `RfcommConnection` is a
+  connection to one of them (in the RFCOMM specification, a data link
+  connection to the service's channel; BlueZ finds the channel). It is
+  *opened* and *closed*: opening it brings the link up if it is not up
+  already, which may wake a device that wakes when connected to; closing it
+  ends only this connection, and leaves the link, and any other services on
+  it, to BlueZ.
+
+What a service connection carries is a byte stream. Data arrives in chunks
+as the device sends it, with no message boundaries, so framing the bytes
+into a device's messages is the caller's job. A write is done once the
+bytes are on their way; the stream has no acknowledgement that the device
+read them.
+
+Two more things follow from how connections are made:
+
+- **One owner per process.** aio-rfcomm allows one Bluetooth object in a
+  process. This library opens it on first use and every caller shares it,
+  so open connections through this library rather than opening aio-rfcomm
+  directly. A device's service has at most one connection at a time.
+- **Bytes on open.** Some devices change state soon after a connection
+  opens and only answer a request sent before then. Bytes given as
+  `write_on_open` are sent from this library's own thread the moment the
+  connection opens, however busy the application's event loop is.
 
 ## Installation
 
