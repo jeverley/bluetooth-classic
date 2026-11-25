@@ -54,10 +54,10 @@ asyncio event loop, without compiled extensions.
 Method names follow [bleak](https://github.com/hbldh/bleak)'s where there is
 an equivalent.
 - **Connect** to a device's RFCOMM service, such as its serial port, through
-  [serialx](https://github.com/puddly/serialx) with `rfcomm://` URLs. BlueZ
-  makes the connection, through its profile API, as it does bleak's, and
-  bytes to send on connect go out from a D-Bus thread of its own the moment
-  BlueZ hands the connection over.
+  [serialx](https://github.com/puddly/serialx) with `rfcomm://` URLs.
+  [aio-rfcomm](https://github.com/dlech/aio-rfcomm) makes the connection
+  (through BlueZ's profile API), and bytes to send on connect go out from a
+  thread of its own the moment the channel opens.
 
 It covers what a Classic device needs that the usual Python Bluetooth
 libraries do not, and nothing about any one kind of device.

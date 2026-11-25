@@ -27,18 +27,18 @@ Read the Docs.
   `async with`).
 - Connections: only the generic `rfcomm://` serialx handler. No device
   protocols; callers bring their own.
-- The `rfcomm://` handler connects through BlueZ's profile API, as bleak's
-  connections go through BlueZ: register as a client of the service only
-  while in use, `ConnectProfile`, write `write_on_connect` inside
-  `Profile1.NewConnection`, and `DisconnectProfile` when the link closes
-  (BlueZ keeps its own reference; without it the next connect hangs).
-  All D-Bus work for it runs on its own event loop in a background
-  thread, so the write happens however busy the caller's loop is.
-  No raw Bluetooth sockets, no SDP of our own, no channel-only URLs, and
-  only serialx's asyncio API. Links say which adapter they are on, and are
-  listed while open, so they can later be shown alongside Home Assistant's
-  Bluetooth devices and connections.
-- `agent.py` and `profile.py` must not use
+- The `rfcomm://` handler gets its connections from aio-rfcomm (BlueZ's
+  profile API on Linux), the way serialx's `esphome://` uses
+  `aioesphomeapi`. aio-rfcomm allows one Bluetooth object per process: the
+  handler owns it, on its own event loop in a background thread, so
+  `write_on_connect` is sent the moment the channel opens however busy the
+  caller's loop is. No Bluetooth or D-Bus code of our own for it, no
+  channel-only URLs, and only serialx's asyncio API. Open links are
+  listed, so they can later be shown alongside Home Assistant's Bluetooth
+  devices and connections.
+- The handler is meant to move to serialx; this library then drops it
+  (no re-export), keeping discovery, scans and pairing.
+- `agent.py` must not use
   `from __future__ import annotations`: dbus-fast reads the D-Bus
   signatures from the method annotations.
 - Before committing: `ruff check .`, `ruff format --check .`, `mypy src

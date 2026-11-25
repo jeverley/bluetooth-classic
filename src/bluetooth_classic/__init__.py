@@ -9,7 +9,6 @@ from .exceptions import (
     DeviceNotFoundError,
     NoAdapterError,
     PairingError,
-    ProfileInUseError,
     RfcommConnectError,
 )
 from .models import ClassicDevice
@@ -37,7 +36,6 @@ __all__ = [
     "DeviceNotFoundError",
     "NoAdapterError",
     "PairingError",
-    "ProfileInUseError",
     "RfcommConnectError",
     "RfcommLink",
     "RfcommTarget",
