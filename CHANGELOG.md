@@ -1,6 +1,72 @@
 # CHANGELOG
 
 
+## v0.9.0 (2026-11-25)
+
+### Bug Fixes
+
+- Abort while opening, and close between retries
+  ([`b6313d1`](https://github.com/jeverley/bluetooth-classic/commit/b6313d146a2dbde385f531db948380201e52553a))
+
+- abort() while the link is opening drops it as soon as it opens; open() raises with ECONNABORTED. -
+  close() or abort() while establish_rfcomm_connection() waits to try again stops it, with
+  ECONNABORTED, instead of opening the link on the next try. - CLAUDE.md: device operations follow
+  bleak's names; RFCOMM connections use the RFCOMM terms (opened and closed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Documentation
+
+- Closing stops establish_rfcomm_connection() from trying again
+  ([`b5af9e9`](https://github.com/jeverley/bluetooth-classic/commit/b5af9e981663ca9bec4ebb45d731bff429b141e4))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+- Explain devices, links and service connections
+  ([`431de02`](https://github.com/jeverley/bluetooth-classic/commit/431de02d20da91a05390b41732a0ec3018ea6028))
+
+The README says what each operation acts on: the device (found, paired, trusted), the link BlueZ
+  owns and shares between services, and a service connection, which is opened and closed and carries
+  a byte stream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Features
+
+- Rfcommconnection, driving aio-rfcomm's channel directly
+  ([`f47686b`](https://github.com/jeverley/bluetooth-classic/commit/f47686b84e0b382ad9b63017bec012bfdb6495f8))
+
+RfcommConnection is a connection to a device's RFCOMM service, named for what the RFCOMM
+  specification calls it: open(), write(), write_nowait(), close() and abort(), with a data callback
+  and a closed callback. It drives aio-rfcomm's channel directly, with no asyncio transport in
+  between. opened_at is now taken on the owner's thread when the link really opened, not when a busy
+  caller's loop saw it.
+
+BREAKING CHANGE: RfcommClient is replaced by RfcommConnection: connect() is open(), disconnect() is
+  close(), write_on_connect is write_on_open, is_connected is is_open, connected_at is opened_at,
+  disconnected_callback is closed_callback and disconnect_reason is close_reason.
+  establish_rfcomm_connection() calls open(). create_rfcomm_connection(), RfcommTransport,
+  RfcommLink, open_rfcomm_links() and on_rfcomm_links_changed() are removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Breaking Changes
+
+- Rfcommclient is replaced by RfcommConnection: connect() is open(), disconnect() is close(),
+  write_on_connect is write_on_open, is_connected is is_open, connected_at is opened_at,
+  disconnected_callback is closed_callback and disconnect_reason is close_reason.
+  establish_rfcomm_connection() calls open(). create_rfcomm_connection(), RfcommTransport,
+  RfcommLink, open_rfcomm_links() and on_rfcomm_links_changed() are removed.
+
+
 ## v0.8.2 (2026-11-25)
 
 ### Bug Fixes
