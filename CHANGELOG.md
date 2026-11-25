@@ -1,6 +1,21 @@
 # CHANGELOG
 
 
+## v0.7.1 (2026-11-25)
+
+### Bug Fixes
+
+- Log why an RFCOMM channel did not open
+  ([`6e8722c`](https://github.com/jeverley/bluetooth-classic/commit/6e8722cda5c8926e27290af7f6854e695dfe308f))
+
+When a connect fails, the handler logs aio-rfcomm's error and the BlueZ error it came from, with how
+  long after asking; a connect given up is logged too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.7.0 (2026-11-25)
 
 ### Chores
