@@ -11,7 +11,8 @@ async with BluetoothClassic(adapter="hci0") as bluetooth:
 ```
 
 Entering the block connects to BlueZ on the system bus and chooses the
-adapter: the one you name, or else the first powered one. Leaving it closes
+adapter: the one you name, or else BlueZ's first, powered or not, which is
+the one aio-rfcomm opens RFCOMM links on. Leaving it closes
 the connection. An application that already has a system bus connection can
 pass it as `bus`; it is then left open. The method names follow bleak's
 where there is an equivalent.
@@ -110,9 +111,9 @@ and returns `(transport, protocol)`.
 The device must be known to BlueZ (paired).
 
 aio-rfcomm uses BlueZ's first adapter; there is no option to choose one.
-{class}`~bluetooth_classic.BluetoothClassic` pairs on the first powered
-adapter, so on a machine with several adapters, pair the device on BlueZ's
-first, or the link cannot be opened.
+{class}`~bluetooth_classic.BluetoothClassic` uses the same one unless you
+name another, so a device it pairs can be connected. Pairing on another
+adapter you name leaves the device unreachable by RFCOMM links.
 
 Link security is BlueZ's for client profiles: there is no option for it.
 Whether BlueZ asks for an encrypted link by default is unconfirmed.

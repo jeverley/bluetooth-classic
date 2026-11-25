@@ -43,11 +43,14 @@ def test_normalize_address() -> None:
         normalize_address("not an address")
 
 
-async def test_connect_picks_the_first_powered_adapter(bus: FakeBus) -> None:
+async def test_connect_picks_the_first_adapter_as_aio_rfcomm_does(
+    bus: FakeBus,
+) -> None:
+    # Even powered off: links would be opened on it, not on hci1.
     bus.objects["/org/bluez/hci0"][ADAPTER]["Powered"] = Variant("b", False)
     bus.objects["/org/bluez/hci1"] = {ADAPTER: {"Powered": Variant("b", True)}}
     bluetooth = await connect(bus)
-    assert bluetooth.adapter == "hci1"
+    assert bluetooth.adapter == "hci0"
 
 
 async def test_connect_uses_the_adapter_asked_for(bus: FakeBus) -> None:

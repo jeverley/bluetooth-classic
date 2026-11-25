@@ -109,8 +109,10 @@ class BluetoothClassic:
         """Prepare a connection; it opens on entering the ``async with`` block.
 
         Args:
-            adapter: The adapter's name, such as ``"hci0"``. ``None`` picks the
-                first powered adapter, or the first adapter if none is powered.
+            adapter: The adapter's name, such as ``"hci0"``. ``None`` picks
+                BlueZ's first adapter, as aio-rfcomm does for RFCOMM links, so
+                a device paired here can be connected; if it is powered off,
+                scans and pairing raise NoAdapterError.
             bus: A system bus connection to use instead of opening one. It is
                 left open when this connection closes.
         """
@@ -530,8 +532,9 @@ def _choose_adapter(objects: _ManagedObjects, adapter: str | None) -> str:
         raise NoAdapterError(f"Bluetooth adapter {adapter} not found")
     if not adapters:
         raise NoAdapterError("No Bluetooth adapter found")
-    powered = [path for path, props in adapters if _unwrap(props.get("Powered"))]
-    return (powered or [adapters[0][0]])[0]
+    # The first by object path, powered or not: the one aio-rfcomm opens
+    # RFCOMM links on, so pairing and links use the same adapter.
+    return adapters[0][0]
 
 
 async def _managed_objects(bus: MessageBus) -> _ManagedObjects:
