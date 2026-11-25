@@ -261,8 +261,10 @@ async def test_create_rfcomm_connection_connects_by_service(
 
 async def test_a_second_link_to_a_device_is_refused(bluetooth: FakeBluetooth) -> None:
     transport, protocol = await _open()
-    with pytest.raises(RfcommConnectError, match="already has a link"):
+    with pytest.raises(RfcommConnectError, match="already has a link") as raised:
         await _open()
+    # Busy, so establish_rfcomm_connection() tries again.
+    assert raised.value.errno == errno.EBUSY
     assert len(bluetooth.channels) == 1
     assert not protocol.lost.is_set()
     # Another device can be connected meanwhile.
@@ -584,3 +586,37 @@ async def test_establish_connects_a_real_client(bluetooth: FakeBluetooth) -> Non
     await establish_rfcomm_connection(client, write_on_connect=REQUEST)
     assert bluetooth.channels[0].sent == [REQUEST]
     await client.disconnect()
+
+
+async def test_establish_needs_an_attempt() -> None:
+    with pytest.raises(ValueError):
+        await establish_rfcomm_connection(_Flaky(busy=0), max_attempts=0)
+
+
+async def test_establish_waits_out_an_old_link_still_closing(
+    bluetooth: FakeBluetooth,
+) -> None:
+    bluetooth.close_delay = 0.2
+    _, protocol = await _open()
+    bluetooth.from_device(bluetooth.channels[0], None)
+    await asyncio.wait_for(protocol.lost.wait(), 0.1)
+    client = RfcommClient(SPEAKER_ADDRESS, service=SERIAL_PORT)
+    with patch.object(rfcomm, "RETRY_DELAY", 0.1):
+        await establish_rfcomm_connection(client)
+    assert _connected(client)
+    await client.disconnect()
+
+
+async def test_disconnecting_while_connecting_closes_the_link(
+    bluetooth: FakeBluetooth,
+) -> None:
+    bluetooth.delay = 0.1
+    client = RfcommClient(SPEAKER_ADDRESS, service=SERIAL_PORT)
+    connecting = asyncio.ensure_future(client.connect())
+    await asyncio.sleep(0.02)
+    await client.disconnect()
+    with pytest.raises(RfcommConnectError) as raised:
+        await connecting
+    assert raised.value.errno == errno.ECONNABORTED
+    assert not _connected(client)
+    await _until(bluetooth.channels[0].closed.is_set)

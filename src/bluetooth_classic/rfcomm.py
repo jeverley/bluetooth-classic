@@ -557,7 +557,7 @@ class RfcommTransport(asyncio.Transport):
 
 
 # BlueZ's errors for a device or service still busy, as just after a link
-# closed. Which one BlueZ gives the soundbar is unconfirmed.
+# closed. Which one BlueZ gives is unconfirmed.
 _BUSY_ERRORS = frozenset({"org.bluez.Error.InProgress", "org.bluez.Error.Busy"})
 
 
@@ -620,8 +620,10 @@ async def create_rfcomm_connection(
     key = (target.address, target.service)
     with _links_lock:
         if key in _busy:
+            # Busy, as BlueZ would say: an old link may still be closing.
             raise RfcommConnectError(
-                f"{target.address} already has a link to {target.service}"
+                errno.EBUSY,
+                f"{target.address} already has a link to {target.service}",
             )
         _busy.add(key)
 
@@ -704,6 +706,10 @@ class RfcommClient:
         self._timeout = timeout
         self._transport: RfcommTransport | None = None
         self._closed: asyncio.Event | None = None
+        # Set while connect() is opening the link, and once it has finished.
+        self._opening: asyncio.Event | None = None
+        # Set when disconnect() is called while the link is still opening.
+        self._abandoned = False
         #: When the link last opened, in ``time.monotonic()`` seconds.
         self.connected_at: float | None = None
         #: Why the link last ended: ``None`` when closed here.
@@ -727,13 +733,26 @@ class RfcommClient:
         if self.is_connected:
             return
         self._closed = asyncio.Event()
-        await create_rfcomm_connection(
-            self.address,
-            lambda: _ClientProtocol(self),
-            service=self.service,
-            timeout=self._timeout if timeout is None else timeout,
-            write_on_connect=write_on_connect,
-        )
+        self._abandoned = False
+        opening = self._opening = asyncio.Event()
+        try:
+            await create_rfcomm_connection(
+                self.address,
+                lambda: _ClientProtocol(self),
+                service=self.service,
+                timeout=self._timeout if timeout is None else timeout,
+                write_on_connect=write_on_connect,
+            )
+        finally:
+            self._opening = None
+            opening.set()
+        if self._abandoned:
+            # disconnect() was called while it opened: close it again.
+            await self.disconnect()
+            raise RfcommConnectError(
+                errno.ECONNABORTED,
+                f"Disconnected from {self.address} while connecting",
+            )
 
     def write_nowait(self, data: bytes) -> None:
         """Queue bytes to send, in order, without waiting.
@@ -756,7 +775,15 @@ class RfcommClient:
         await self._transport.drain()
 
     async def disconnect(self) -> None:
-        """Close the link, once what is queued has been sent, and wait."""
+        """Close the link, once what is queued has been sent, and wait.
+
+        Called while the link is still opening, it waits for that, and the
+        link is closed as soon as it opens.
+        """
+        opening = self._opening
+        if opening is not None:
+            self._abandoned = True
+            await opening.wait()
         transport, closed = self._transport, self._closed
         if transport is None or closed is None:
             return
@@ -832,6 +859,8 @@ async def establish_rfcomm_connection(
         TimeoutError: No connection within the timeout.
     """
     attempts = MAX_ATTEMPTS if max_attempts is None else max_attempts
+    if attempts < 1:
+        raise ValueError(f"max_attempts must be at least 1, not {attempts}")
     delay = RETRY_DELAY if retry_delay is None else retry_delay
     for attempt in range(1, attempts + 1):
         try:
@@ -849,4 +878,4 @@ async def establish_rfcomm_connection(
             await asyncio.sleep(delay)
         else:
             return client
-    raise AssertionError("unreachable")
+    raise AssertionError("unreachable")  # pragma: no cover
