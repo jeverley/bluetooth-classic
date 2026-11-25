@@ -372,7 +372,8 @@ async def _open_channel(
         opened = time.monotonic()
         if write_on_connect:
             await channel.send(write_on_connect)
-    except BaseException:
+    except BaseException as err:
+        _log_failure(target, time.monotonic() - asked, err)
         await asyncio.shield(stack.aclose())
         raise
     _LOGGER.debug(
@@ -384,6 +385,33 @@ async def _open_channel(
         (time.monotonic() - opened) * 1000,
     )
     return _Channel(stack, channel)
+
+
+def _log_failure(target: RfcommTarget, after: float, err: BaseException) -> None:
+    """Log why a channel did not open, with what BlueZ said if known."""
+    if isinstance(err, asyncio.CancelledError):
+        _LOGGER.debug(
+            "Gave up opening %s's service %s %.3f s after asking",
+            target.address,
+            target.service,
+            after,
+        )
+        return
+    cause = err.__cause__
+    said = ""
+    if cause is not None:
+        # aio-rfcomm raises its own error from BlueZ's D-Bus error.
+        name = getattr(cause, "type", None) or type(cause).__name__
+        said = f"; from {name}: {cause}"
+    _LOGGER.debug(
+        "Could not open %s's service %s %.3f s after asking: %s: %s%s",
+        target.address,
+        target.service,
+        after,
+        type(err).__name__,
+        err,
+        said,
+    )
 
 
 def _closed(err: BaseException) -> OSError:

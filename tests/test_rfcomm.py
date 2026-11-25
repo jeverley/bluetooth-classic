@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import sys
 import threading
 import time
@@ -289,6 +290,26 @@ async def test_failing_to_connect(bluetooth: FakeBluetooth) -> None:
     # The device can be tried again.
     bluetooth.fail = None
     await _close(*await _open())
+
+
+async def test_a_failure_is_logged_with_what_bluez_said(
+    bluetooth: FakeBluetooth, caplog: pytest.LogCaptureFixture
+) -> None:
+    class BlueZError(Exception):
+        type = "org.bluez.Error.InProgress"
+
+    failure = ConnectionFailedError("refused")
+    failure.__cause__ = BlueZError("br-connection-busy")
+    bluetooth.fail = failure
+    with (
+        caplog.at_level(logging.DEBUG, logger=rfcomm.__name__),
+        pytest.raises(RfcommConnectError),
+    ):
+        await _open()
+    [record] = [r for r in caplog.records if "Could not open" in r.getMessage()]
+    message = record.getMessage()
+    assert "ConnectionFailedError: refused" in message
+    assert "from org.bluez.Error.InProgress: br-connection-busy" in message
 
 
 async def test_aio_rfcomm_open_elsewhere(bluetooth: FakeBluetooth) -> None:
