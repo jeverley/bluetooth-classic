@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v0.8.2 (2026-11-25)
+
+### Bug Fixes
+
+- Retry while an old link closes, and close a link disconnected while opening
+  ([`052637c`](https://github.com/jeverley/bluetooth-classic/commit/052637ce31ea6a180ac04ffa0eaae6843d6150ad))
+
+- The one-link-per-service refusal carries errno EBUSY, so establish_rfcomm_connection() tries again
+  while an old link is still closing after a drop. - RfcommClient.disconnect() called while
+  connect() is opening the link waits for it and closes the link as soon as it opens; connect() then
+  raises with ECONNABORTED. - establish_rfcomm_connection() refuses fewer than one attempt with
+  ValueError. - A comment no longer names a device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.8.1 (2026-11-25)
 
 ### Bug Fixes
