@@ -1,6 +1,44 @@
 # CHANGELOG
 
 
+## v0.7.0 (2026-11-25)
+
+### Chores
+
+- Keep breaking changes on 0.x to minor releases
+  ([`f59c37c`](https://github.com/jeverley/bluetooth-classic/commit/f59c37cba8276c4170c7fd67426dd2ea7c6b4022))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Features
+
+- Open RFCOMM links with aio-rfcomm
+  ([`31cafa4`](https://github.com/jeverley/bluetooth-classic/commit/31cafa46f3d16f3a4a50e9bd92e73f78935475bb))
+
+The rfcomm:// handler now gets its connections from aio-rfcomm, which takes the same BlueZ profile
+  route on Linux, instead of our own profile code. The handler owns aio-rfcomm's one Bluetooth
+  object, on an event loop of its own in a background thread, so write_on_connect is sent the moment
+  the channel opens however busy the caller's loop is. profile.py is removed.
+
+BREAKING CHANGE: rfcomm:// URLs and rfcomm_url() no longer take an adapter (aio-rfcomm uses BlueZ's
+  first). RfcommLink and RfcommTarget lose their adapter and channel fields, links no longer report
+  rfcomm_channel or rfcomm_adapter, and ProfileInUseError is removed: aio-rfcomm's errors are raised
+  as RfcommConnectError.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+### Breaking Changes
+
+- Rfcomm:// URLs and rfcomm_url() no longer take an adapter (aio-rfcomm uses BlueZ's first).
+  RfcommLink and RfcommTarget lose their adapter and channel fields, links no longer report
+  rfcomm_channel or rfcomm_adapter, and ProfileInUseError is removed: aio-rfcomm's errors are raised
+  as RfcommConnectError.
+
+
 ## v0.6.2 (2026-11-24)
 
 ### Bug Fixes
