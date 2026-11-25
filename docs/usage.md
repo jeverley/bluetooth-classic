@@ -107,7 +107,9 @@ just after a link closes, BlueZ can refuse a new one for a moment, and it
 tries again (four times, a second apart) while the error says the device is
 busy. Such errors are raised as {class}`~bluetooth_classic.RfcommConnectError`
 with `errno` `EBUSY`; which error BlueZ gives is unconfirmed.
-`connection.open()` tries once.
+`connection.open()` tries once. Closing the connection (`close()` or
+`abort()`) while it waits to try again stops it, with `ECONNABORTED`, and
+closing while the link opens closes it as soon as it opens.
 
 Code written as an `asyncio.Protocol` can be attached with
 `data_callback=protocol.data_received` and a `closed_callback` that calls
