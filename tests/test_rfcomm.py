@@ -1,29 +1,33 @@
-"""Tests for the rfcomm:// serialx handler, with a fake BlueZ profile API."""
+"""Tests for the rfcomm:// serialx handler, with a fake aio-rfcomm."""
 
 from __future__ import annotations
 
 import asyncio
 import io
-import socket
 import sys
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 import serialx
+from aio_rfcomm.errors import (
+    BluetoothAlreadyOpenError,
+    ChannelClosedError,
+    ConnectionFailedError,
+)
 
 from bluetooth_classic import (
     SERIAL_PORT,
-    ProfileInUseError,
     RfcommConnectError,
     service_uuid,
 )
 from bluetooth_classic.rfcomm import (
     RfcommLink,
-    RfcommSerialTransport,
     RfcommTarget,
     on_rfcomm_links_changed,
     open_rfcomm,
@@ -32,46 +36,115 @@ from bluetooth_classic.rfcomm import (
     rfcomm_url,
 )
 
-from .conftest import DEVICE, SPEAKER, SPEAKER_ADDRESS, SPP, FakeBus, device_properties
+from .conftest import SPEAKER_ADDRESS
 
 URL = f"rfcomm://{SPEAKER_ADDRESS}?service=1101"
+OTHER = "66:77:88:99:AA:BB"
 REQUEST = b"hello"
 
 # serialx uses whichever copy of the module registered first; patch that one.
 rfcomm = sys.modules[serialx.common.get_uri_handler(URL).async_transport_cls.__module__]
-profile_module = sys.modules[rfcomm.__name__.rsplit(".", 1)[0] + ".profile"]
 
 
 class _Recorder(asyncio.Protocol):
     def __init__(self) -> None:
         self.events: list[tuple[Any, ...]] = []
         self.lost = asyncio.Event()
+        self.data = asyncio.Event()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.events.append(("made",))
 
     def data_received(self, data: bytes) -> None:
         self.events.append(("data", data))
+        self.data.set()
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.events.append(("lost", exc))
         self.lost.set()
 
 
+class FakeChannel:
+    """An aio-rfcomm channel; used on the handler's background loop."""
+
+    def __init__(self, address: str, service: UUID) -> None:
+        self.address = address
+        self.service = service
+        self.sent: list[bytes] = []
+        self.closed = threading.Event()
+        self.incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Cleared to hold sends, as a device that stops reading does.
+        self.sending = asyncio.Event()
+        self.sending.set()
+
+    async def send(self, data: bytes) -> None:
+        await self.sending.wait()
+        if self.closed.is_set():
+            raise ChannelClosedError
+        self.sent.append(data)
+
+    async def receive(self) -> bytes:
+        data = await self.incoming.get()
+        if data is None:
+            raise ChannelClosedError
+        return data
+
+
+class FakeBluetooth:
+    """aio-rfcomm's Bluetooth object."""
+
+    def __init__(self) -> None:
+        self.opened = 0
+        self.channels: list[FakeChannel] = []
+        self.delay = 0.0
+        self.hang = False
+        self.fail: Exception | None = None
+        self.already_open = False
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    @asynccontextmanager
+    async def open_bluetooth(self) -> AsyncIterator[FakeBluetooth]:
+        if self.already_open:
+            raise BluetoothAlreadyOpenError("open elsewhere")
+        self.opened += 1
+        self.loop = asyncio.get_running_loop()
+        yield self
+
+    @asynccontextmanager
+    async def open_service(
+        self, device: Any, service: UUID
+    ) -> AsyncIterator[FakeChannel]:
+        await asyncio.sleep(self.delay)
+        if self.hang:
+            await asyncio.sleep(10)
+        if self.fail is not None:
+            raise self.fail
+        channel = FakeChannel(device.address, service)
+        self.channels.append(channel)
+        try:
+            yield channel
+        finally:
+            channel.closed.set()
+
+    def on_loop(self, callback: Callable[..., Any], *args: Any) -> None:
+        """Run ``callback`` on the handler's background loop."""
+        assert self.loop is not None
+        self.loop.call_soon_threadsafe(callback, *args)
+
+    def from_device(self, channel: FakeChannel, data: bytes | None) -> None:
+        """The device sends bytes, or ends the link with None."""
+        self.on_loop(channel.incoming.put_nowait, data)
+
+
 @pytest.fixture
-def bluez(bus: FakeBus) -> Iterator[FakeBus]:
-    """BlueZ on the fake bus, as the handler's bus."""
-
-    async def connect_bus() -> FakeBus:
-        return bus
-
-    profiles = profile_module._Profiles()
-    with (
-        patch.object(profiles, "_connect_bus", connect_bus),
-        patch.object(profile_module, "_profiles", profiles),
-    ):
-        yield bus
-    bus.close()
+def bluetooth() -> Iterator[FakeBluetooth]:
+    """aio-rfcomm, faked; the handler's thread is stopped afterwards."""
+    fake = FakeBluetooth()
+    with patch.object(rfcomm.aio_rfcomm, "open_bluetooth", fake.open_bluetooth):
+        yield fake
+    rfcomm._owner.shutdown()
+    rfcomm._busy.clear()
+    rfcomm._links.clear()
 
 
 async def _open(url: str = URL, **kwargs: Any) -> tuple[Any, _Recorder]:
@@ -82,12 +155,17 @@ async def _open(url: str = URL, **kwargs: Any) -> tuple[Any, _Recorder]:
     return transport, protocol
 
 
-async def _settle() -> None:
-    """Let pending work finish, here and on the D-Bus thread."""
-    for _ in range(200):
+async def _until(condition: Callable[[], Any], timeout: float = 1.0) -> None:
+    """Wait until ``condition()`` holds, here or on the handler's thread."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
         await asyncio.sleep(0.005)
-        if not rfcomm._releasing and not profile_module._tasks:
-            return
+
+
+async def _close(transport: Any, protocol: _Recorder) -> None:
+    transport.close()
+    await asyncio.wait_for(protocol.lost.wait(), 1)
 
 
 def test_service_uuids() -> None:
@@ -99,12 +177,11 @@ def test_service_uuids() -> None:
 
 
 def test_urls() -> None:
-    url = rfcomm_url("00-11-22-33-44-55", service="1101", adapter="hci1")
+    url = rfcomm_url("00-11-22-33-44-55", service="1101")
     assert url == (
         f"rfcomm://{SPEAKER_ADDRESS}?service=00001101-0000-1000-8000-00805f9b34fb"
-        "&adapter=hci1"
     )
-    assert parse_rfcomm_url(url) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT, "hci1")
+    assert parse_rfcomm_url(url) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT)
     assert parse_rfcomm_url(URL) == RfcommTarget(SPEAKER_ADDRESS, SERIAL_PORT)
 
 
@@ -118,7 +195,7 @@ def test_urls() -> None:
         "rfcomm://00:11:22:33:44:55?service=serial",
         "rfcomm://00:11:22:33:44:55?service=",
         "rfcomm://00:11:22:33:44:55?service=1101&service=1102",
-        "rfcomm://00:11:22:33:44:55?service=1101&adapter=eth0",
+        "rfcomm://00:11:22:33:44:55?service=1101&adapter=hci0",
         "rfcomm://not-an-address?service=1101",
     ],
 )
@@ -127,269 +204,172 @@ def test_bad_urls(url: str) -> None:
         parse_rfcomm_url(url)
 
 
-async def test_bluez_connects_and_the_request_goes_first(bluez: FakeBus) -> None:
-    bluez.reply_on_connect = b"reply"
+def test_the_service_is_a_uuid() -> None:
+    assert isinstance(parse_rfcomm_url(URL).service, UUID)
+
+
+async def test_the_request_goes_first(bluetooth: FakeBluetooth) -> None:
     transport, protocol = await _open(write_on_connect=REQUEST)
-    assert isinstance(transport, RfcommSerialTransport)
-    # Registered as a client, then connected by service.
-    assert bluez.members()[-1] == "ConnectProfile"
-    assert ("ConnectProfile", SPEAKER, [SPP]) in bluez.calls
-    [(_, uuid)] = bluez.profiles.items()
-    assert uuid == SPP
-    device = bluez.device_ends[0]
-    device.settimeout(1)
-    # Written inside BlueZ's handover, before anything else.
-    assert device.recv(64) == REQUEST
-    transport.write(b"next")
-    assert device.recv(64) == b"next"
-    await _settle()
-    assert protocol.events[:2] == [("made",), ("data", b"reply")]
+    [channel] = bluetooth.channels
+    assert (channel.address, channel.service) == (SPEAKER_ADDRESS, SERIAL_PORT)
+    assert channel.sent == [REQUEST]
     assert transport.get_extra_info("rfcomm_service") == SERIAL_PORT
-    assert transport.get_extra_info("rfcomm_adapter") == "hci0"
-    transport.close()
-    await asyncio.wait_for(protocol.lost.wait(), 1)
-    await _settle()
-    # BlueZ drops its side, and the registration goes once unused.
-    assert bluez.members()[-2:] == ["DisconnectProfile", "UnregisterProfile"]
-    assert bluez.profiles == {}
+    transport.write(b"more")
+    await _until(lambda: channel.sent == [REQUEST, b"more"])
+    bluetooth.from_device(channel, b"reply")
+    await asyncio.wait_for(protocol.data.wait(), 1)
+    await _close(transport, protocol)
+    assert protocol.events == [("made",), ("data", b"reply"), ("lost", None)]
+    assert channel.closed.is_set()
 
 
-async def test_the_device_closing_the_link_is_reported(bluez: FakeBus) -> None:
+async def test_aio_rfcomm_is_opened_once(bluetooth: FakeBluetooth) -> None:
+    first = await _open()
+    second = await _open(f"rfcomm://{OTHER}?service=1101")
+    assert bluetooth.opened == 1
+    await _close(*first)
+    await _close(*second)
+
+
+async def test_the_device_ending_the_link_is_reported(
+    bluetooth: FakeBluetooth,
+) -> None:
     _, protocol = await _open()
-    bluez.device_ends[0].close()
+    [channel] = bluetooth.channels
+    bluetooth.from_device(channel, None)
     await asyncio.wait_for(protocol.lost.wait(), 1)
-    await _settle()
-    assert bluez.profiles == {}
+    assert isinstance(protocol.events[-1][1], ConnectionResetError)
+    assert open_rfcomm_links() == []
+    await _until(channel.closed.is_set)
 
 
-async def test_open_rfcomm_connects_by_service(bluez: FakeBus) -> None:
+async def test_open_rfcomm_connects_by_service(bluetooth: FakeBluetooth) -> None:
     transport, protocol = await open_rfcomm(
         "00-11-22-33-44-55", _Recorder, service=SERIAL_PORT, write_on_connect=REQUEST
     )
-    bluez.device_ends[0].settimeout(1)
-    assert bluez.device_ends[0].recv(64) == REQUEST
-    transport.close()
+    assert bluetooth.channels[0].sent == [REQUEST]
     assert isinstance(protocol, _Recorder)
-    await asyncio.wait_for(protocol.lost.wait(), 1)
+    await _close(transport, protocol)
 
 
-async def test_links_share_one_registration(bluez: FakeBus) -> None:
-    other = "/org/bluez/hci0/dev_66_77_88_99_AA_BB"
-    bluez.objects[other] = {DEVICE: device_properties("66:77:88:99:AA:BB", "Other")}
-    first, first_protocol = await _open()
-    second, second_protocol = await _open("rfcomm://66:77:88:99:AA:BB?service=1101")
-    assert bluez.members().count("RegisterProfile") == 1
-    first.close()
-    await asyncio.wait_for(first_protocol.lost.wait(), 1)
-    await _settle()
-    # Still in use by the second link.
-    assert len(bluez.profiles) == 1
-    second.close()
-    await asyncio.wait_for(second_protocol.lost.wait(), 1)
-    await _settle()
-    assert bluez.profiles == {}
-
-
-async def test_a_second_link_to_a_device_is_refused(bluez: FakeBus) -> None:
+async def test_a_second_link_to_a_device_is_refused(bluetooth: FakeBluetooth) -> None:
     transport, protocol = await _open()
-    calls = len(bluez.calls)
     with pytest.raises(RfcommConnectError, match="already has a link"):
         await _open()
-    # The open link was left alone: BlueZ was not asked to disconnect it.
-    assert "DisconnectProfile" not in [m for m, _, _ in bluez.calls[calls:]]
+    assert len(bluetooth.channels) == 1
     assert not protocol.lost.is_set()
-    transport.close()
-    await asyncio.wait_for(protocol.lost.wait(), 1)
-    await _settle()
+    # Another device can be connected meanwhile.
+    await _close(*await _open(f"rfcomm://{OTHER}?service=1101"))
+    await _close(transport, protocol)
     # Once closed, the device can be connected again.
-    transport, protocol = await _open()
-    transport.close()
-    await asyncio.wait_for(protocol.lost.wait(), 1)
+    await _close(*await _open())
 
 
-async def test_open_links_are_listed(bluez: FakeBus) -> None:
+async def test_open_links_are_listed(bluetooth: FakeBluetooth) -> None:
     changes: list[list[RfcommLink]] = []
     unsubscribe = on_rfcomm_links_changed(lambda: changes.append(open_rfcomm_links()))
     try:
         transport, protocol = await _open()
         [listed] = open_rfcomm_links()
-        assert (listed.address, listed.service, listed.adapter) == (
-            SPEAKER_ADDRESS,
-            SERIAL_PORT,
-            "hci0",
-        )
-        transport.close()
-        await asyncio.wait_for(protocol.lost.wait(), 1)
+        assert (listed.address, listed.service) == (SPEAKER_ADDRESS, SERIAL_PORT)
+        await _close(transport, protocol)
         assert open_rfcomm_links() == []
         assert changes == [[listed], []]
     finally:
         unsubscribe()
 
 
-async def test_bluez_failing_to_connect(bluez: FakeBus) -> None:
-    bluez.handover = False
-    bluez.errors["ConnectProfile"] = "org.bluez.Error.Failed"
+async def test_failing_to_connect(bluetooth: FakeBluetooth) -> None:
+    bluetooth.fail = ConnectionFailedError("refused")
     with pytest.raises(RfcommConnectError) as raised:
         await _open()
     # An OSError too, as the link could not be opened.
     assert isinstance(raised.value, OSError)
-    await _settle()
-    assert bluez.profiles == {}
+    assert isinstance(raised.value.__cause__, ConnectionFailedError)
+    # The device can be tried again.
+    bluetooth.fail = None
+    await _close(*await _open())
 
 
-async def test_another_program_holding_the_service(bluez: FakeBus) -> None:
-    bluez.profiles["/elsewhere"] = SPP
-    with pytest.raises(ProfileInUseError):
+async def test_aio_rfcomm_open_elsewhere(bluetooth: FakeBluetooth) -> None:
+    bluetooth.already_open = True
+    with pytest.raises(RfcommConnectError, match="one owner"):
         await _open()
-    assert "/org/bluetooth_classic/profile" not in "".join(bluez.exported)
 
 
-async def test_an_unknown_device(bluez: FakeBus) -> None:
-    with pytest.raises(RfcommConnectError, match="pair it first"):
-        await _open("rfcomm://66:77:88:99:AA:BB?service=1101")
-    with pytest.raises(RfcommConnectError):
-        await _open(f"{URL}&adapter=hci1")
-    await _settle()
-    assert bluez.profiles == {}
-
-
-async def test_no_connection_in_time(bluez: FakeBus) -> None:
-    bluez.unanswered.add("ConnectProfile")
+async def test_no_connection_in_time(bluetooth: FakeBluetooth) -> None:
+    bluetooth.hang = True
     with pytest.raises(TimeoutError):
         await _open(connect_timeout=0.05)
-    await _settle()
-    assert bluez.profiles == {}
+    bluetooth.hang = False
+    await _close(*await _open())
 
 
-async def test_a_connection_nobody_waits_for_is_closed() -> None:
-    strays: list[str] = []
-    profile = profile_module._Profile(strays.append)
-    ours, device = socket.socketpair()
-    profile.NewConnection.__wrapped__(profile, SPEAKER, ours.detach(), {})
-    device.settimeout(1)
-    # The handler's end was closed, and BlueZ is to drop its side.
-    assert device.recv(1) == b""
-    assert strays == [SPEAKER]
-    device.close()
-
-
-async def test_a_handover_after_giving_up_is_dropped(bluez: FakeBus) -> None:
-    # Another device's link keeps the registration, so BlueZ can still hand
-    # over a socket after the connect was given up.
-    other = "/org/bluez/hci0/dev_66_77_88_99_AA_BB"
-    bluez.objects[other] = {DEVICE: device_properties("66:77:88:99:AA:BB", "Other")}
-    held, held_protocol = await _open("rfcomm://66:77:88:99:AA:BB?service=1101")
-    bluez.handover_delay = 0.1
-    with pytest.raises(TimeoutError):
-        await _open(connect_timeout=0.05, write_on_connect=REQUEST)
-    for _ in range(50):
-        if len(bluez.device_ends) == 2:
-            break
-        await asyncio.sleep(0.01)
-    await _settle()
-    device = bluez.device_ends[1]
-    device.settimeout(1)
-    # Nothing was sent to the device, our end is closed, and BlueZ was
-    # asked to drop the link after it arrived.
-    assert device.recv(64) == b""
-    assert bluez.calls[-1] == ("DisconnectProfile", SPEAKER, [SPP])
-    held.close()
-    await asyncio.wait_for(held_protocol.lost.wait(), 1)
-
-
-async def test_a_registration_from_an_older_bus_is_not_counted(
-    bluez: FakeBus,
+async def test_the_request_goes_out_while_the_caller_is_busy(
+    bluetooth: FakeBluetooth,
 ) -> None:
-    first, first_protocol = await _open()
-    # D-Bus restarts: the next link registers again on a new bus.
-    bluez.connected = False
-    newer = FakeBus()
-    newer.objects = bluez.objects
-
-    async def connect_bus() -> FakeBus:
-        return newer
-
-    with patch.object(profile_module._profiles, "_connect_bus", connect_bus):
-        second, second_protocol = await _open()
-        first.close()
-        await asyncio.wait_for(first_protocol.lost.wait(), 1)
-        await _settle()
-        # The first link's release did not touch the new registration.
-        assert len(newer.profiles) == 1
-        second.close()
-        await asyncio.wait_for(second_protocol.lost.wait(), 1)
-        await _settle()
-        assert newer.profiles == {}
-    newer.close()
-
-
-async def test_the_request_goes_out_while_the_caller_is_busy(bluez: FakeBus) -> None:
-    bluez.handover_delay = 0.05
+    bluetooth.delay = 0.05
     task = asyncio.ensure_future(_open(write_on_connect=REQUEST))
     await asyncio.sleep(0.01)
     # The caller's event loop is blocked (Home Assistant starting up) while
-    # BlueZ hands the connection over.
+    # the channel opens.
     time.sleep(0.3)
-    [device] = bluez.device_ends
-    device.setblocking(False)
-    # Already written, by the D-Bus thread, before the caller's loop ran again.
-    assert device.recv(64) == REQUEST
-    transport, protocol = await task
-    transport.close()
-    await asyncio.wait_for(protocol.lost.wait(), 1)
+    # Already sent, from the handler's own loop, before the caller's ran again.
+    assert bluetooth.channels[0].sent == [REQUEST]
+    await _close(*await task)
 
 
-async def test_a_connect_given_up_midway_is_released(bluez: FakeBus) -> None:
-    bluez.handover_delay = 0.1
+async def test_a_connect_given_up_midway_is_closed(bluetooth: FakeBluetooth) -> None:
+    bluetooth.delay = 0.1
     task = asyncio.ensure_future(_open())
     await asyncio.sleep(0.02)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    for _ in range(100):
-        if bluez.device_ends and not bluez.profiles:
-            break
-        await asyncio.sleep(0.01)
-    # The link it opened anyway was closed, and BlueZ asked to drop it.
-    device = bluez.device_ends[0]
-    device.settimeout(1)
-    assert device.recv(1) == b""
-    assert bluez.profiles == {}
-    assert "DisconnectProfile" in bluez.members()[-3:]
+    # The channel it opened anyway is closed, and the device freed after.
+    await _until(lambda: bluetooth.channels and bluetooth.channels[0].closed.is_set())
+    await _until(lambda: not rfcomm._busy)
+    bluetooth.delay = 0
+    await _close(*await _open())
 
 
-async def test_bytes_before_connection_made_are_held() -> None:
-    loop = asyncio.get_running_loop()
-    protocol = _Recorder()
-    transport = RfcommSerialTransport(loop, protocol)
-    transport._data_received(b"early")
-    assert protocol.events == []
-    transport._connection_made()
-    transport._data_received(b"late")
-    assert protocol.events == [("made",), ("data", b"early"), ("data", b"late")]
+async def test_close_sends_what_is_queued_first(bluetooth: FakeBluetooth) -> None:
+    transport, protocol = await _open()
+    [channel] = bluetooth.channels
+    bluetooth.on_loop(channel.sending.clear)
+    await asyncio.sleep(0.01)
+    transport.write(b"last")
+    assert transport.get_write_buffer_size() == 4
+    transport.close()
+    await asyncio.sleep(0.05)
+    assert not protocol.lost.is_set()
+    bluetooth.on_loop(channel.sending.set)
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+    assert channel.sent == [b"last"]
+    assert channel.closed.is_set()
 
 
-async def test_a_link_dropped_as_it_opens_fails_the_connect(bluez: FakeBus) -> None:
-    loop = asyncio.get_running_loop()
-    original = loop.create_connection
+async def test_abort_drops_what_is_queued(bluetooth: FakeBluetooth) -> None:
+    transport, protocol = await _open()
+    [channel] = bluetooth.channels
+    bluetooth.on_loop(channel.sending.clear)
+    await asyncio.sleep(0.01)
+    transport.write(b"dropped")
+    transport.close()
+    transport.abort()
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+    assert channel.sent == []
+    assert channel.closed.is_set()
 
-    async def dropping(factory: Any, **kwargs: Any) -> Any:
-        # The device resets the link before the protocol is attached.
-        transport, proxy = await original(factory, **kwargs)
-        proxy.connection_lost(ConnectionResetError(104, "reset by peer"))
-        return transport, proxy
 
-    protocol = _Recorder()
-    with (
-        patch.object(loop, "create_connection", dropping),
-        pytest.raises(ConnectionResetError),
-    ):
-        await serialx.create_serial_connection(
-            loop, lambda: protocol, URL, baudrate=9600
-        )
-    assert protocol.events == []
-    await _settle()
-    assert bluez.profiles == {}
+async def test_flush_waits_until_sent(bluetooth: FakeBluetooth) -> None:
+    transport, protocol = await _open()
+    [channel] = bluetooth.channels
+    transport.write(b"data")
+    await asyncio.wait_for(transport.flush(), 1)
+    assert channel.sent == [b"data"]
+    assert transport.get_write_buffer_size() == 0
+    await _close(transport, protocol)
 
 
 def test_blocking_use_is_refused() -> None:
@@ -403,7 +383,3 @@ async def test_write_on_connect_is_only_for_rfcomm() -> None:
     handler = serialx.common.get_uri_handler("socket://localhost:1")
     routed = serialx.common.route_backend_kwargs(handler, {"write_on_connect": REQUEST})
     assert routed == {}
-
-
-def test_the_service_is_a_uuid() -> None:
-    assert isinstance(parse_rfcomm_url(URL).service, UUID)

@@ -89,8 +89,8 @@ transport, protocol = await serialx.create_serial_connection(
 The baud rate is required by serialx and ignored. The URL takes:
 
 - `service`: the service's UUID, or its 16- or 32-bit short form (`1101`).
-- `adapter` (optional): the local adapter, such as `hci0`. Without it,
-  BlueZ chooses.
+
+aio-rfcomm uses BlueZ's first adapter; there is no option to choose one.
 
 The device must be known to BlueZ (paired). serialx's blocking
 `serial_for_url()` refuses `rfcomm://` URLs.
@@ -100,35 +100,28 @@ Whether BlueZ asks for an encrypted link by default is unconfirmed.
 
 ### How it connects
 
-BlueZ makes the connection, through its profile API, as it makes bleak's
-connections: the handler registers as a client of the service, asks BlueZ
-to connect it on the device, and BlueZ finds the channel and hands over the
-connected socket over D-Bus. No Bluetooth sockets of Python's own are
-needed. When the link closes, the handler asks BlueZ to drop its side too
-(BlueZ keeps its own reference to the connection), and unregisters the
-service once no link uses it.
+[aio-rfcomm](https://github.com/dlech/aio-rfcomm) makes the connection. On
+Linux it registers with BlueZ as a client of the service, asks BlueZ to
+connect it on the device, and BlueZ finds the channel and hands over the
+connected socket over D-Bus. Links within one process share the
+registration; BlueZ accepts one per service UUID, so while one is open,
+another program cannot connect to that service through BlueZ.
 
-BlueZ accepts one registration per service UUID, so while one of the
-handler's links is open, another program cannot connect to that service
-through BlueZ, and the other way round:
-{class}`~bluetooth_classic.ProfileInUseError` says so. Links within one
-process share the registration. A process has at most one link to a
-device's service at a time: opening a second, while the first is open or
-opening, raises {class}`~bluetooth_classic.RfcommConnectError`.
-
-The D-Bus side runs on an event loop of its own, in a background thread, so
-BlueZ's handover is handled the moment it arrives, however busy the
-application's event loop is.
+aio-rfcomm allows one Bluetooth object per process. The handler opens it on
+first use and keeps it, on an event loop of its own in a background thread;
+if something else in the process has already opened aio-rfcomm, connecting
+raises {class}`~bluetooth_classic.RfcommConnectError`. A process has at
+most one link to a device's service at a time: opening a second, while the
+first is open or opening, raises it too.
 
 Two connection options are also accepted: `connect_timeout`, which bounds
-the whole open, and
-`write_on_connect`, bytes written the moment BlueZ hands the connection
-over, before anything else runs. Use it for a device that changes state
-soon after a connection opens and only answers a request sent before then.
+the whole open, and `write_on_connect`, bytes sent from the handler's own
+loop the moment the channel opens, however busy the application's loop is.
+Use it for a device that changes state soon after a connection opens and
+only answers a request sent before then.
 
-An open connection reports the channel BlueZ connected to, the service and
-the adapter through `get_extra_info()` (`rfcomm_channel`, `rfcomm_service`,
-`rfcomm_adapter`). {func}`~bluetooth_classic.open_rfcomm_links` lists the
+An open connection reports its service through `get_extra_info()`
+(`rfcomm_service`). {func}`~bluetooth_classic.open_rfcomm_links` lists the
 links open through the handler, and
 {func}`~bluetooth_classic.on_rfcomm_links_changed` calls back whenever one
 opens or closes.

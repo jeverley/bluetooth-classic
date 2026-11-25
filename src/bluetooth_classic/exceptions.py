@@ -20,11 +20,7 @@ class PairingError(BluetoothClassicError):
 
 
 class RfcommConnectError(BluetoothClassicError, OSError):
-    """BlueZ could not open the RFCOMM service on the device.
+    """The RFCOMM service on the device could not be opened.
 
     An ``OSError`` too, as the link could not be opened.
     """
-
-
-class ProfileInUseError(RfcommConnectError):
-    """Another program has registered the same service with BlueZ."""
