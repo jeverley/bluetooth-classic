@@ -818,8 +818,8 @@ async def establish_rfcomm_connection(
     *,
     timeout: float | None = None,
     write_on_connect: bytes = b"",
-    max_attempts: int = MAX_ATTEMPTS,
-    retry_delay: float = RETRY_DELAY,
+    max_attempts: int | None = None,
+    retry_delay: float | None = None,
 ) -> _ClientT:
     """Connect a client, retrying while BlueZ says the device is busy.
 
@@ -831,20 +831,22 @@ async def establish_rfcomm_connection(
         RfcommConnectError: The service could not be opened.
         TimeoutError: No connection within the timeout.
     """
-    for attempt in range(1, max_attempts + 1):
+    attempts = MAX_ATTEMPTS if max_attempts is None else max_attempts
+    delay = RETRY_DELAY if retry_delay is None else retry_delay
+    for attempt in range(1, attempts + 1):
         try:
             await client.connect(timeout=timeout, write_on_connect=write_on_connect)
         except OSError as err:
-            if err.errno != errno.EBUSY or attempt == max_attempts:
+            if err.errno != errno.EBUSY or attempt == attempts:
                 raise
             _LOGGER.debug(
                 "Busy (attempt %d of %d), trying again in %.1f s: %s",
                 attempt,
-                max_attempts,
-                retry_delay,
+                attempts,
+                delay,
                 err,
             )
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(delay)
         else:
             return client
     raise AssertionError("unreachable")
