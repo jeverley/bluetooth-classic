@@ -1,6 +1,26 @@
 # CHANGELOG
 
 
+## v0.7.2 (2026-11-25)
+
+### Bug Fixes
+
+- Free a device after a drop only once its link has closed
+  ([`0b7f4e1`](https://github.com/jeverley/bluetooth-classic/commit/0b7f4e1ef83b9b1eb54af163fc930fbeeb09f8e3))
+
+- After the device or Bluetooth ends a link, the drop is still reported at once, but the device
+  service can only be connected again once the old channel has closed, so a new link cannot race its
+  teardown. - A link that ended is reported as ConnectionResetError with ECONNRESET, as a socket
+  reports it; Bluetooth going away is ConnectionAbortedError. - A connect given up while opening no
+  longer leaves an exception that is never retrieved. - A timeout is logged as one, without the
+  cancellation it caused. - A device aio-rfcomm does not know says that it uses BlueZ's first
+  adapter, and the docs say to pair the device on it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CciW4UG1YNtAD3yvwo7sxt
+
+
 ## v0.7.1 (2026-11-25)
 
 ### Bug Fixes
