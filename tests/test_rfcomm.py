@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import gc
 import io
 import logging
 import sys
@@ -16,10 +18,13 @@ from uuid import UUID
 
 import pytest
 import serialx
+from aio_rfcomm import Availability
 from aio_rfcomm.errors import (
     BluetoothAlreadyOpenError,
+    BluetoothUnavailableError,
     ChannelClosedError,
     ConnectionFailedError,
+    DeviceNotFoundError,
 )
 
 from bluetooth_classic import (
@@ -73,7 +78,8 @@ class FakeChannel:
         self.service = service
         self.sent: list[bytes] = []
         self.closed = threading.Event()
-        self.incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Bytes from the device; None ends the link, an exception fails it.
+        self.incoming: asyncio.Queue[bytes | Exception | None] = asyncio.Queue()
         # Cleared to hold sends, as a device that stops reading does.
         self.sending = asyncio.Event()
         self.sending.set()
@@ -88,6 +94,8 @@ class FakeChannel:
         data = await self.incoming.get()
         if data is None:
             raise ChannelClosedError
+        if isinstance(data, Exception):
+            raise data
         return data
 
 
@@ -101,6 +109,8 @@ class FakeBluetooth:
         self.hang = False
         self.fail: Exception | None = None
         self.already_open = False
+        # Seconds a channel takes to close.
+        self.close_delay = 0.0
         self.loop: asyncio.AbstractEventLoop | None = None
 
     @asynccontextmanager
@@ -125,6 +135,7 @@ class FakeBluetooth:
         try:
             yield channel
         finally:
+            await asyncio.sleep(self.close_delay)
             channel.closed.set()
 
     def on_loop(self, callback: Callable[..., Any], *args: Any) -> None:
@@ -132,8 +143,8 @@ class FakeBluetooth:
         assert self.loop is not None
         self.loop.call_soon_threadsafe(callback, *args)
 
-    def from_device(self, channel: FakeChannel, data: bytes | None) -> None:
-        """The device sends bytes, or ends the link with None."""
+    def from_device(self, channel: FakeChannel, data: bytes | Exception | None) -> None:
+        """The device sends bytes, ends the link (None), or it fails."""
         self.on_loop(channel.incoming.put_nowait, data)
 
 
@@ -239,9 +250,40 @@ async def test_the_device_ending_the_link_is_reported(
     [channel] = bluetooth.channels
     bluetooth.from_device(channel, None)
     await asyncio.wait_for(protocol.lost.wait(), 1)
-    assert isinstance(protocol.events[-1][1], ConnectionResetError)
+    lost = protocol.events[-1][1]
+    # As a socket reports it: RFCOMM reports even a hang-up as a reset.
+    assert isinstance(lost, ConnectionResetError)
+    assert lost.errno == errno.ECONNRESET
     assert open_rfcomm_links() == []
     await _until(channel.closed.is_set)
+
+
+async def test_bluetooth_going_away_is_an_abort(bluetooth: FakeBluetooth) -> None:
+    _, protocol = await _open()
+    [channel] = bluetooth.channels
+    bluetooth.from_device(channel, BluetoothUnavailableError(Availability.SWITCHED_OFF))
+    await asyncio.wait_for(protocol.lost.wait(), 1)
+    lost = protocol.events[-1][1]
+    assert isinstance(lost, ConnectionAbortedError)
+    assert lost.errno == errno.ECONNABORTED
+
+
+async def test_after_a_drop_the_device_is_freed_once_the_link_has_closed(
+    bluetooth: FakeBluetooth,
+) -> None:
+    bluetooth.close_delay = 0.2
+    _, protocol = await _open()
+    [channel] = bluetooth.channels
+    bluetooth.from_device(channel, None)
+    # The drop is reported at once...
+    await asyncio.wait_for(protocol.lost.wait(), 0.1)
+    # ...but a new link waits for the old one to close.
+    with pytest.raises(RfcommConnectError, match="already has a link"):
+        await _open()
+    await _until(channel.closed.is_set)
+    await _until(lambda: not rfcomm._busy)
+    bluetooth.close_delay = 0
+    await _close(*await _open())
 
 
 async def test_open_rfcomm_connects_by_service(bluetooth: FakeBluetooth) -> None:
@@ -310,6 +352,49 @@ async def test_a_failure_is_logged_with_what_bluez_said(
     message = record.getMessage()
     assert "ConnectionFailedError: refused" in message
     assert "from org.bluez.Error.InProgress: br-connection-busy" in message
+
+
+async def test_a_timeout_is_logged_as_one(
+    bluetooth: FakeBluetooth, caplog: pytest.LogCaptureFixture
+) -> None:
+    bluetooth.hang = True
+    with (
+        caplog.at_level(logging.DEBUG, logger=rfcomm.__name__),
+        pytest.raises(TimeoutError),
+    ):
+        await _open(connect_timeout=0.05)
+    [record] = [r for r in caplog.records if "Could not open" in r.getMessage()]
+    assert "TimeoutError" in record.getMessage()
+    assert "Cancelled" not in record.getMessage()
+
+
+async def test_an_unknown_device_says_which_adapter(bluetooth: FakeBluetooth) -> None:
+    bluetooth.fail = DeviceNotFoundError(SPEAKER_ADDRESS)
+    with pytest.raises(RfcommConnectError, match="first adapter"):
+        await _open()
+
+
+async def test_a_connect_given_up_leaves_nothing_unretrieved(
+    bluetooth: FakeBluetooth,
+) -> None:
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _, context: unhandled.append(context))
+    try:
+        bluetooth.delay = 0.05
+        bluetooth.fail = ConnectionFailedError("refused")
+        task = asyncio.ensure_future(_open())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _until(lambda: not rfcomm._busy)
+        await asyncio.sleep(0.01)
+        gc.collect()
+        await asyncio.sleep(0.01)
+        assert unhandled == []
+    finally:
+        loop.set_exception_handler(None)
 
 
 async def test_aio_rfcomm_open_elsewhere(bluetooth: FakeBluetooth) -> None:

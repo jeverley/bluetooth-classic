@@ -91,6 +91,9 @@ The baud rate is required by serialx and ignored. The URL takes:
 - `service`: the service's UUID, or its 16- or 32-bit short form (`1101`).
 
 aio-rfcomm uses BlueZ's first adapter; there is no option to choose one.
+{class}`~bluetooth_classic.BluetoothClassic` pairs on the first powered
+adapter, so on a machine with several adapters, pair the device on BlueZ's
+first, or the link cannot be opened.
 
 The device must be known to BlueZ (paired). serialx's blocking
 `serial_for_url()` refuses `rfcomm://` URLs.
@@ -119,6 +122,11 @@ the whole open, and `write_on_connect`, bytes sent from the handler's own
 loop the moment the channel opens, however busy the application's loop is.
 Use it for a device that changes state soon after a connection opens and
 only answers a request sent before then.
+
+When the device or Bluetooth ends a link, the protocol's `connection_lost()`
+gets a `ConnectionResetError` (`ECONNRESET`): aio-rfcomm does not say why a
+link ended, as RFCOMM reports even an orderly hang-up as a reset. Bluetooth
+itself going away gives a `ConnectionAbortedError` instead.
 
 An open connection reports its service through `get_extra_info()`
 (`rfcomm_service`). {func}`~bluetooth_classic.open_rfcomm_links` lists the

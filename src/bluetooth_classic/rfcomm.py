@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import errno
 import io
 import logging
 import threading
@@ -41,7 +42,13 @@ from typing import Any
 from uuid import UUID
 
 import aio_rfcomm
-from aio_rfcomm.errors import BluetoothAlreadyOpenError, RfcommError
+from aio_rfcomm.errors import (
+    BluetoothAlreadyOpenError,
+    BluetoothUnavailableError,
+    ChannelClosedError,
+    DeviceNotFoundError,
+    RfcommError,
+)
 from serialx import (
     BaseSerial,
     BaseSerialTransport,
@@ -399,6 +406,9 @@ def _log_failure(target: RfcommTarget, after: float, err: BaseException) -> None
         return
     cause = err.__cause__
     said = ""
+    if isinstance(err, TimeoutError):
+        # Its cause is only the cancellation the timeout made.
+        cause = None
     if cause is not None:
         # aio-rfcomm raises its own error from BlueZ's D-Bus error.
         name = getattr(cause, "type", None) or type(cause).__name__
@@ -415,8 +425,23 @@ def _log_failure(target: RfcommTarget, after: float, err: BaseException) -> None
 
 
 def _closed(err: BaseException) -> OSError:
-    """Report a channel ending as the connection error it is."""
-    error = ConnectionResetError(str(err) or type(err).__name__)
+    """Report a channel ending as the connection error it is.
+
+    aio-rfcomm does not keep why a link ended: RFCOMM reports even an
+    orderly hang-up as a reset. So a link that ended is a reset, as a socket
+    reports it, and Bluetooth itself going away is an abort.
+    """
+    error: OSError
+    if isinstance(err, BluetoothUnavailableError):
+        error = ConnectionAbortedError(
+            errno.ECONNABORTED, f"Bluetooth is not available: {err}"
+        )
+    elif isinstance(err, ChannelClosedError):
+        error = ConnectionResetError(errno.ECONNRESET, "The link has ended")
+    else:
+        error = ConnectionResetError(
+            errno.ECONNRESET, f"The link failed: {type(err).__name__}: {err}"
+        )
     error.__cause__ = err
     return error
 
@@ -525,18 +550,27 @@ class RfcommSerialTransport(BaseSerialTransport):
         opening = asyncio.run_coroutine_threadsafe(
             _open_channel(target, connect_timeout, serial._write_on_connect), bg
         )
+        waiting = asyncio.wrap_future(opening)
         try:
-            channel = await asyncio.shield(asyncio.wrap_future(opening))
+            channel = await asyncio.shield(waiting)
         except asyncio.CancelledError:
             # Left to finish on the background loop, then closed; the device
-            # service stays busy until then.
+            # service stays busy until then. Its outcome is read here, so
+            # nothing is logged as never retrieved.
             self._busy = None
+            waiting.add_done_callback(_ignore_outcome)
             opening.add_done_callback(lambda done: _abandon(done, key))
             raise
         except RfcommError as err:
+            hint = ""
+            if isinstance(err, DeviceNotFoundError):
+                hint = (
+                    " (aio-rfcomm uses BlueZ's first adapter: is the device "
+                    "paired on it?)"
+                )
             raise RfcommConnectError(
                 f"{target.address}'s service {target.service} could not be "
-                f"opened: {err}"
+                f"opened: {err}{hint}"
             ) from err
         self._channel = channel
         bg.call_soon_threadsafe(
@@ -567,9 +601,10 @@ class RfcommSerialTransport(BaseSerialTransport):
         self._closing = True
         self._ended = exc
         self._mark_broken(exc)
-        # Reported at once; the channel closes behind it.
-        self._close_channel(drain=False, then_finish=False)
-        self._finish()
+        # Reported at once; the device service is freed once the channel
+        # has closed behind it, so a new link cannot race its teardown.
+        self._report_lost()
+        self._close_channel(drain=False, then_finish=False, then_free=True)
 
     def write(self, data: bytes | bytearray | memoryview) -> None:
         """Send data, in order."""
@@ -597,10 +632,12 @@ class RfcommSerialTransport(BaseSerialTransport):
         self._mark_user_closed()
         self._close_channel(drain=False, then_finish=first)
 
-    def _close_channel(self, *, drain: bool, then_finish: bool) -> None:
+    def _close_channel(
+        self, *, drain: bool, then_finish: bool, then_free: bool = False
+    ) -> None:
         channel = self._channel
         if channel is None:
-            if then_finish:
+            if then_finish or then_free:
                 self._finish()
             return
         closing = asyncio.run_coroutine_threadsafe(
@@ -609,12 +646,22 @@ class RfcommSerialTransport(BaseSerialTransport):
         if then_finish:
             finish = _call_on(self._loop, self._finish)
             closing.add_done_callback(lambda _: finish())
+        elif then_free:
+            free = _call_on(self._loop, self._free)
+            closing.add_done_callback(lambda _: free())
 
     def _finish(self) -> None:
-        _remove_link(id(self))
+        self._free()
+        self._report_lost()
+
+    def _free(self) -> None:
+        """Let the device service be connected again."""
         if self._busy is not None:
             _release(self._busy)
             self._busy = None
+
+    def _report_lost(self) -> None:
+        _remove_link(id(self))
         self._unsent = 0
         self._sent.set()
         self._call_protocol_connection_lost(self._ended)
@@ -634,6 +681,12 @@ class RfcommSerialTransport(BaseSerialTransport):
 
     async def _reconfigure_port(self, update: Any) -> None:
         """RFCOMM has no port settings."""
+
+
+def _ignore_outcome(waiting: asyncio.Future[_Channel]) -> None:
+    """Read a given-up open's outcome, which _abandon deals with."""
+    if not waiting.cancelled():
+        waiting.exception()
 
 
 def _abandon(
