@@ -430,8 +430,13 @@ class RfcommConnection:
         self._closed: asyncio.Event | None = None
         # Set while open() is opening the link, and once it has finished.
         self._opening: asyncio.Event | None = None
-        # Set when close() is called while the link is still opening.
+        # Set when close() or abort() is called while the link is opening,
+        # and whether it was abort().
         self._abandoned = False
+        self._abort_on_open = False
+        # Set by close() or abort(): establish_rfcomm_connection() then stops
+        # trying again. Cleared when it starts.
+        self._close_requested = False
         self._unsent = 0
         self._sent = asyncio.Event()
         self._sent.set()
@@ -480,7 +485,8 @@ class RfcommConnection:
         self._holding = True
         self._loop = asyncio.get_running_loop()
         self._channel = None
-        self._closing = self._reported = self._abandoned = False
+        self._closing = self._reported = False
+        self._abandoned = self._abort_on_open = False
         self._closed = asyncio.Event()
         self.close_reason = None
         opening = self._opening = asyncio.Event()
@@ -502,8 +508,12 @@ class RfcommConnection:
             _call_on(loop, self._end),
         )
         if self._abandoned:
-            # close() was called while it opened: close it again.
-            await self.close()
+            # close() or abort() was called while it opened: do that now.
+            if self._abort_on_open:
+                self.abort()
+                await self._closed.wait()
+            else:
+                await self.close()
             raise RfcommConnectError(
                 errno.ECONNABORTED, f"Closed {self.address} while opening"
             )
@@ -579,8 +589,10 @@ class RfcommConnection:
 
         A device that stops reading holds it at most ``DRAIN_TIMEOUT``
         seconds. Called while the link is still opening, it waits for that,
-        and the link is closed as soon as it opens.
+        and the link is closed as soon as it opens; called while
+        :func:`establish_rfcomm_connection` waits to try again, it stops it.
         """
+        self._close_requested = True
         opening = self._opening
         if opening is not None:
             self._abandoned = True
@@ -593,7 +605,16 @@ class RfcommConnection:
         await self._closed.wait()
 
     def abort(self) -> None:
-        """Close at once, dropping what is queued."""
+        """Close at once, dropping what is queued.
+
+        Called while the link is still opening, it is closed the same way as
+        soon as it opens; called while :func:`establish_rfcomm_connection`
+        waits to try again, it stops it.
+        """
+        self._close_requested = True
+        if self._opening is not None:
+            self._abandoned = self._abort_on_open = True
+            return
         if self._channel is None:
             return
         first = not self._closing
@@ -703,7 +724,14 @@ async def establish_rfcomm_connection(
     if attempts < 1:
         raise ValueError(f"max_attempts must be at least 1, not {attempts}")
     delay = RETRY_DELAY if retry_delay is None else retry_delay
+    if isinstance(connection, RfcommConnection):
+        connection._close_requested = False
     for attempt in range(1, attempts + 1):
+        if attempt > 1 and getattr(connection, "_close_requested", False):
+            # Closed while waiting to try again.
+            raise RfcommConnectError(
+                errno.ECONNABORTED, "Closed while waiting to try again"
+            )
         try:
             await connection.open(timeout=timeout, write_on_open=write_on_open)
         except OSError as err:

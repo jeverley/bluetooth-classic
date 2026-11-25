@@ -22,9 +22,12 @@ Read the Docs.
 - No device-specific behaviour: callers filter devices themselves. Docs,
   comments and tests use generic devices and example addresses only
   (such as `00:11:22:33:44:55`), never real ones.
-- Method names and parameters follow bleak's where there is an equivalent
-  (`discover(timeout=)`, `find_device_by_address()`, `pair()`, `unpair()`,
-  `async with`).
+- Device operations follow bleak's names and parameters where there is an
+  equivalent (`discover(timeout=)`, `find_device_by_address()`, `pair()`,
+  `unpair()`, `async with`). RFCOMM connections use the RFCOMM terms
+  instead: a connection is opened and closed (`open()`, `close()`,
+  `is_open`, `closed_callback`), as it is one service connection on a link
+  BlueZ owns, not the device's connection.
 - Connections: only generic RFCOMM connections: `RfcommConnection` (open,
   write, close; data and closing as callbacks; named for what the RFCOMM
   specification calls it) and `establish_rfcomm_connection()`, shaped like

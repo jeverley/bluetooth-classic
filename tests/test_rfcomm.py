@@ -582,3 +582,39 @@ async def test_establish_waits_out_an_old_link_still_closing(
         await establish_rfcomm_connection(connection)
     assert _open_now(connection)
     await connection.close()
+
+
+async def test_aborting_while_opening_drops_the_link(
+    bluetooth: FakeBluetooth,
+) -> None:
+    bluetooth.delay = 0.1
+    connection = _connection()
+    opening = asyncio.ensure_future(connection.open(write_on_open=REQUEST))
+    await asyncio.sleep(0.02)
+    connection.abort()
+    with pytest.raises(RfcommConnectError) as raised:
+        await opening
+    assert raised.value.errno == errno.ECONNABORTED
+    assert not _open_now(connection)
+    await _until(bluetooth.channels[0].closed.is_set)
+    # The device service is free again.
+    await _until(lambda: not rfcomm._busy)
+
+
+async def test_closing_between_retries_stops_them(bluetooth: FakeBluetooth) -> None:
+    bluetooth.fail = _refusal("org.bluez.Error.InProgress", "Operation in progress")
+    connection = _connection()
+    with patch.object(rfcomm, "RETRY_DELAY", 0.2):
+        establishing = asyncio.ensure_future(establish_rfcomm_connection(connection))
+        await asyncio.sleep(0.05)
+        await connection.close()
+        bluetooth.fail = None
+        with pytest.raises(RfcommConnectError) as raised:
+            await establishing
+    assert raised.value.errno == errno.ECONNABORTED
+    # It gave up rather than opening the link on its next try.
+    assert bluetooth.channels == []
+    # A fresh establish opens it.
+    await establish_rfcomm_connection(connection)
+    assert _open_now(connection)
+    await connection.close()
