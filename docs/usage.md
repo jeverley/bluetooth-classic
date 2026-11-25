@@ -153,4 +153,3 @@ An open link reports its address and service through `get_extra_info()`
 lists the open links, and
 {func}`~bluetooth_classic.on_rfcomm_links_changed` calls back whenever one
 opens or closes.
-
