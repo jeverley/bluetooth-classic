@@ -145,6 +145,10 @@ Low Energy devices, let one part of it decide when they run.
 
 See [CONTRIBUTING.md](https://github.com/jeverley/bluetooth-classic/blob/main/CONTRIBUTING.md).
 
+Developed with AI assistance (Claude Code). Changes are reviewed and tested
+by the maintainer, and behaviour is confirmed on real hardware (an LG G1
+soundbar with Home Assistant) before release.
+
 ## Credits
 
 The project layout and tooling follow the
