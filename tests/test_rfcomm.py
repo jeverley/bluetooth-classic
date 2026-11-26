@@ -80,6 +80,8 @@ class FakeBluetooth:
         self.already_open = False
         # Seconds a channel takes to close.
         self.close_delay = 0.0
+        # Whether new channels hold sends, as a device that never reads does.
+        self.hold_sends = False
         self.loop: asyncio.AbstractEventLoop | None = None
 
     @asynccontextmanager
@@ -101,6 +103,8 @@ class FakeBluetooth:
             raise self.fail
         channel = FakeChannel(device.address, service)
         self.channels.append(channel)
+        if self.hold_sends:
+            channel.sending.clear()
         try:
             yield channel
         finally:
@@ -618,3 +622,69 @@ async def test_closing_between_retries_stops_them(bluetooth: FakeBluetooth) -> N
     await establish_rfcomm_connection(connection)
     assert _open_now(connection)
     await connection.close()
+
+
+async def test_the_device_is_freed_once_the_callers_loop_has_gone(
+    bluetooth: FakeBluetooth,
+) -> None:
+    bluetooth.close_delay = 0.1
+
+    async def elsewhere() -> None:
+        _, recorder = await _open()
+        [channel] = bluetooth.channels
+        bluetooth.from_device(channel, None)
+        await recorder.got_closed.wait()
+        # The loop ends while the channel is still closing.
+
+    await asyncio.to_thread(asyncio.run, elsewhere())
+    assert rfcomm._busy
+    await _until(lambda: not rfcomm._busy)
+
+
+async def test_the_timeout_covers_the_opening_write(bluetooth: FakeBluetooth) -> None:
+    bluetooth.hold_sends = True
+    connection = _connection()
+    with pytest.raises(TimeoutError):
+        await connection.open(timeout=0.1, write_on_open=REQUEST)
+    [channel] = bluetooth.channels
+    await _until(channel.closed.is_set)
+    await _until(lambda: not rfcomm._busy)
+
+
+async def test_closing_ends_the_wait_between_retries_at_once(
+    bluetooth: FakeBluetooth,
+) -> None:
+    bluetooth.fail = _refusal("org.bluez.Error.InProgress", "Operation in progress")
+    connection = _connection()
+    with patch.object(rfcomm, "RETRY_DELAY", 10):
+        establishing = asyncio.ensure_future(establish_rfcomm_connection(connection))
+        await asyncio.sleep(0.05)
+        connection.abort()
+        with pytest.raises(RfcommConnectError) as raised:
+            await asyncio.wait_for(establishing, 1)
+    assert raised.value.errno == errno.ECONNABORTED
+
+
+async def test_a_failed_open_clears_opened_at(bluetooth: FakeBluetooth) -> None:
+    connection, _ = await _open()
+    assert connection.opened_at is not None
+    await connection.close()
+    bluetooth.fail = ConnectionFailedError("refused")
+    with pytest.raises(RfcommConnectError):
+        await connection.open()
+    assert connection.opened_at is None
+
+
+async def test_abort_cuts_a_draining_close_short(bluetooth: FakeBluetooth) -> None:
+    connection, recorder = await _open()
+    [channel] = bluetooth.channels
+    bluetooth.on_loop(channel.sending.clear)
+    await asyncio.sleep(0.01)
+    connection.write_nowait(b"stuck")
+    closing = asyncio.ensure_future(connection.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done()
+    connection.abort()
+    await asyncio.wait_for(closing, 1)
+    assert channel.sent == []
+    assert recorder.closed == [connection]

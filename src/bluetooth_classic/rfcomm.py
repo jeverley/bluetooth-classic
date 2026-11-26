@@ -266,9 +266,11 @@ async def _open_channel(
                     aio_rfcomm.RfcommDeviceInfo(target.address), target.service
                 )
             )
-        opened = time.monotonic()
-        if write_on_open:
-            await channel.send(write_on_open)
+            opened = time.monotonic()
+            # Within the timeout: a device that never reads must not hold
+            # the open forever.
+            if write_on_open:
+                await channel.send(write_on_open)
     except BaseException as err:
         _log_failure(target, time.monotonic() - asked, err)
         await asyncio.shield(stack.aclose())
@@ -435,8 +437,8 @@ class RfcommConnection:
         self._abandoned = False
         self._abort_on_open = False
         # Set by close() or abort(): establish_rfcomm_connection() then stops
-        # trying again. Cleared when it starts.
-        self._close_requested = False
+        # waiting and trying again. Cleared when it starts.
+        self._close_requested = asyncio.Event()
         self._unsent = 0
         self._sent = asyncio.Event()
         self._sent.set()
@@ -489,6 +491,7 @@ class RfcommConnection:
         self._abandoned = self._abort_on_open = False
         self._closed = asyncio.Event()
         self.close_reason = None
+        self.opened_at = None
         opening = self._opening = asyncio.Event()
         try:
             channel = await self._open_channel(
@@ -592,7 +595,7 @@ class RfcommConnection:
         and the link is closed as soon as it opens; called while
         :func:`establish_rfcomm_connection` waits to try again, it stops it.
         """
-        self._close_requested = True
+        self._close_requested.set()
         opening = self._opening
         if opening is not None:
             self._abandoned = True
@@ -601,7 +604,7 @@ class RfcommConnection:
             return
         if not self._closing:
             self._closing = True
-            self._close_channel(drain=True, then="finish")
+            self._close_channel(drain=True, report=True)
         await self._closed.wait()
 
     def abort(self) -> None:
@@ -611,15 +614,20 @@ class RfcommConnection:
         soon as it opens; called while :func:`establish_rfcomm_connection`
         waits to try again, it stops it.
         """
-        self._close_requested = True
+        self._close_requested.set()
         if self._opening is not None:
             self._abandoned = self._abort_on_open = True
             return
         if self._channel is None:
             return
-        first = not self._closing
+        if self._closing:
+            # Closing already, perhaps draining: stop sending what is queued.
+            asyncio.run_coroutine_threadsafe(
+                self._channel.close(drain=False), _owner.loop()
+            )
+            return
         self._closing = True
-        self._close_channel(drain=False, then="finish" if first else None)
+        self._close_channel(drain=False, report=True)
 
     async def __aenter__(self) -> RfcommConnection:
         """Open."""
@@ -648,23 +656,35 @@ class RfcommConnection:
         # Reported at once; the device service is freed once the channel
         # has closed behind it, so a new link cannot race its teardown.
         self._report()
-        self._close_channel(drain=False, then="free")
+        self._close_channel(drain=False, report=False)
 
-    def _close_channel(self, *, drain: bool, then: str | None) -> None:
-        channel = self._channel
-        assert channel is not None and self._loop is not None
+    def _close_channel(self, *, drain: bool, report: bool) -> None:
+        """Close the channel; once closed, free the service and say so.
+
+        The service is freed from the owner's thread, so it is freed even if
+        the caller's loop has stopped by then.
+        """
+        channel, closed = self._channel, self._closed
+        assert channel is not None and closed is not None and self._loop
+        key, holding = self._key, self._holding
+        self._holding = False
         closing = asyncio.run_coroutine_threadsafe(
             channel.close(drain=drain), _owner.loop()
         )
-        if then is not None:
-            after = _call_on(
-                self._loop, self._finish if then == "finish" else self._free
-            )
-            closing.add_done_callback(lambda _: after())
+        tell = _call_on(self._loop, self._channel_closed)
 
-    def _finish(self) -> None:
-        self._free()
-        self._report()
+        def done(_: object) -> None:
+            if holding:
+                _release(key)
+            tell(closed, report)
+
+        closing.add_done_callback(done)
+
+    def _channel_closed(self, closed: asyncio.Event, report: bool) -> None:
+        closed.set()
+        # Not for an earlier link, if the connection has been opened again.
+        if report and closed is self._closed:
+            self._report()
 
     def _free(self) -> None:
         """Let the device service be connected again."""
@@ -724,10 +744,12 @@ async def establish_rfcomm_connection(
     if attempts < 1:
         raise ValueError(f"max_attempts must be at least 1, not {attempts}")
     delay = RETRY_DELAY if retry_delay is None else retry_delay
+    stop: asyncio.Event | None = None
     if isinstance(connection, RfcommConnection):
-        connection._close_requested = False
+        stop = connection._close_requested
+        stop.clear()
     for attempt in range(1, attempts + 1):
-        if attempt > 1 and getattr(connection, "_close_requested", False):
+        if stop is not None and stop.is_set():
             # Closed while waiting to try again.
             raise RfcommConnectError(
                 errno.ECONNABORTED, "Closed while waiting to try again"
@@ -744,7 +766,12 @@ async def establish_rfcomm_connection(
                 delay,
                 err,
             )
-            await asyncio.sleep(delay)
+            if stop is None:
+                await asyncio.sleep(delay)
+            else:
+                # close() or abort() ends the wait at once.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), delay)
         else:
             return connection
     raise AssertionError("unreachable")  # pragma: no cover
