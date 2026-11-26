@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.9.1 (2026-11-26)
+
+### Bug Fixes
+
+- Free a closed service and end opens and retry waits reliably
+  ([`99f7f0d`](https://github.com/jeverley/bluetooth-classic/commit/99f7f0df4eec8a4e1b287c763a9507d8c567b38e))
+
+
 ## v0.9.0 (2026-11-25)
 
 ### Bug Fixes
