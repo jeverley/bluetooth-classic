@@ -69,7 +69,8 @@ class FakeBus:
         handler = getattr(self, f"_{message.member}", None)
         if handler is None:
             return self._reply()
-        return await handler(message)
+        result: SimpleNamespace = await handler(message)
+        return result
 
     def export(self, path: str, interface: Any) -> None:
         # dbus-fast refuses a second interface of the same name at a path.

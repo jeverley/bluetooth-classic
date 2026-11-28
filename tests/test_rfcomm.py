@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
+import aio_rfcomm
 import pytest
 from aio_rfcomm import Availability
 from aio_rfcomm.errors import (
@@ -125,7 +126,7 @@ class FakeBluetooth:
 def bluetooth() -> Iterator[FakeBluetooth]:
     """aio-rfcomm, faked; the owner's thread is stopped afterwards."""
     fake = FakeBluetooth()
-    with patch.object(rfcomm.aio_rfcomm, "open_bluetooth", fake.open_bluetooth):
+    with patch.object(aio_rfcomm, "open_bluetooth", fake.open_bluetooth):
         yield fake
     rfcomm._owner.shutdown()
     rfcomm._busy.clear()
